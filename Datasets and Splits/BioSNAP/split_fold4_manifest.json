@@ -1,0 +1,113 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-24T13:16:13.738550+00:00",
+  "dataset": "BioSNAP",
+  "fold": 4,
+  "source": {
+    "dataset_dir": "/mnt/\u5bf9\u6bd4\u5b9e\u9a8c/BioSNAP/datasets",
+    "full_pair": "/mnt/\u5bf9\u6bd4\u5b9e\u9a8c/BioSNAP/datasets/full_pair.csv",
+    "full_pair_sha256": "60f42afedc02b2fd283c0fd70833935e790f7e4976ec541e3d1e7568a19b599f",
+    "feature_bundle": "/mnt/\u5bf9\u6bd4\u5b9e\u9a8c/BioSNAP/Ours/features/v1_features.pt",
+    "feature_sha256": "e923a42a3c765d4f71c5c26b51f7766c78cfeab682a5d75f07f657b1da01de3a"
+  },
+  "protocol": {
+    "outer_split_source": "full_pair.csv",
+    "author_split_pair_assignments_reused": false,
+    "test_assignment": {
+      "algorithm": "deterministic_greedy_balance_positive_negative_drug_count_v1",
+      "seed": 42,
+      "num_folds": 5,
+      "fold_drug_counts": [
+        899,
+        899,
+        901,
+        901,
+        901
+      ],
+      "fold_positive_counts": [
+        2760,
+        2752,
+        2765,
+        2772,
+        2769
+      ],
+      "fold_negative_counts": [
+        2726,
+        2735,
+        2721,
+        2714,
+        2717
+      ]
+    },
+    "test_drug_ids_sha256": "511bb7db54b46514f7d95f4277f453fae12d144f808645d058cbdd2cffd6ed0f",
+    "each_full_pair_drug_is_test_in_exactly_one_fold": true,
+    "rebuilt_cold_validation_fraction": 0.1,
+    "train_validation_test_drug_sets_are_disjoint": true,
+    "strict_protein_known": false,
+    "auxiliary_split_csv_positive_labels_used_only_for_collision_audit": true,
+    "extra_negative_semantics": "unlabeled compound-protein pairs treated as negatives",
+    "negative_pools_are_nested": true,
+    "validation_and_test_negative_pools_are_disjoint": true,
+    "evaluation_ratios": [
+      1,
+      2,
+      5,
+      10,
+      20,
+      50,
+      100
+    ]
+  },
+  "counts": {
+    "feature_drugs": 4505,
+    "feature_proteins": 2181,
+    "train_drugs": 3249,
+    "validation_drugs": 351,
+    "test_drugs": 901,
+    "train_proteins": 2178,
+    "evaluation_proteins": 2181,
+    "train_positive": 9937,
+    "validation_positive": 1112,
+    "test_positive": 2769,
+    "train_explicit_negative": 9864,
+    "validation_explicit_negative": 1032,
+    "test_explicit_negative": 2717,
+    "full_pair_duplicate_rows_removed": 7,
+    "global_known_positive": 13818
+  },
+  "negative_sources": {
+    "train": {
+      "requested": 19874,
+      "author_labeled_negatives": 9864,
+      "sampled_unlabeled_as_negative": 10010,
+      "ordering": "seed-shuffled author negatives first, then sampled unlabeled pairs"
+    },
+    "validation": {
+      "requested": 111200,
+      "author_labeled_negatives": 1032,
+      "sampled_unlabeled_as_negative": 110168,
+      "ordering": "seed-shuffled author negatives first, then sampled unlabeled pairs"
+    },
+    "test": {
+      "requested": 276900,
+      "author_labeled_negatives": 2717,
+      "sampled_unlabeled_as_negative": 274183,
+      "ordering": "seed-shuffled author negatives first, then sampled unlabeled pairs"
+    }
+  },
+  "global_source_audit": {
+    "unique_pairs_across_all_sources": 27431,
+    "pairs_outside_feature_entity_order_ignored_for_collision_audit": 0,
+    "positives_outside_feature_entity_order_ignored_for_collision_audit": 0,
+    "global_known_positive": 13818,
+    "outer_split_assignment_source": "/mnt/\u5bf9\u6bd4\u5b9e\u9a8c/BioSNAP/datasets/full_pair.csv",
+    "auxiliary_split_csvs_used_only_for_positive_collision_audit": 0,
+    "source_files": {
+      "/mnt/\u5bf9\u6bd4\u5b9e\u9a8c/BioSNAP/datasets/full_pair.csv": {
+        "rows_after_deduplication": 27431,
+        "duplicate_rows_removed": 7,
+        "sha256": "60f42afedc02b2fd283c0fd70833935e790f7e4976ec541e3d1e7568a19b599f"
+      }
+    }
+  }
+}
