@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import importlib.util
+import json
+import pickle
+import string
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import torch
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path("/mnt/ablation")
+DEFAULT_V1_DIR = Path("/mnt/ColdstartCPI/V1")
+DEFAULT_MOL2VEC = Path("/mnt/ColdstartCPI/Feature_generation/Mol2Vec/model_300dim.pkl")
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "v1_aligned"
+PROTEIN_MODEL = "Rostlab/prot_bert_bfd"
+SEQUENCE_VALIDATION_VERSION = 2
+SEQUENCE_LETTERS = frozenset(string.ascii_uppercase)
+
+
+def torch_load(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def reset_huggingface_http_client() -> None:
+    """Prevent a stale global Hub client from breaking repeated Jupyter %run calls."""
+    try:
+        from huggingface_hub import close_session
+    except ImportError:
+        return
+    close_session()
+
+
+def load_v1_prepare(v1_dir: Path):
+    prepare_path = v1_dir / "prepare_v1_features.py"
+    common_path = v1_dir / "v1_common.py"
+    for path in [prepare_path, common_path]:
+        if not path.exists():
+            raise FileNotFoundError(path)
+    if str(v1_dir) not in sys.path:
+        sys.path.insert(0, str(v1_dir))
+    spec = importlib.util.spec_from_file_location("small_dataset_v1_prepare", prepare_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot import {prepare_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module, prepare_path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate all V1 drug and ProtBert-BFD protein features for the local 707-drug/"
+            "1489-protein dataset. No ColdstartCPI benchmark pairs are read."
+        )
+    )
+    parser.add_argument("--v1-dir", type=Path, default=DEFAULT_V1_DIR)
+    parser.add_argument("--entity-order", type=Path, default=SCRIPT_DIR / "entity_order.json")
+    parser.add_argument("--smiles-json", type=Path, default=SCRIPT_DIR / "drugs_smiles.json")
+    parser.add_argument(
+        "--protein-csv", type=Path, default=SCRIPT_DIR / "protein_sequences.csv"
+    )
+    parser.add_argument(
+        "--protein-fallback-pkl",
+        type=Path,
+        default=SCRIPT_DIR / "proteins_protvec.pkl",
+    )
+    parser.add_argument("--mol2vec-model", type=Path, default=DEFAULT_MOL2VEC)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--drug-max-tokens", type=int, default=100)
+    parser.add_argument("--functional-group-tokens", type=int, default=32)
+    parser.add_argument("--protein-groups", type=int, default=32)
+    parser.add_argument("--max-residues-per-chunk", type=int, default=1000)
+    parser.add_argument("--expected-drugs", type=int, default=707)
+    parser.add_argument("--expected-proteins", type=int, default=1489)
+    parser.add_argument("--expected-primary-proteins", type=int, default=1266)
+    parser.add_argument("--expected-invalid-primary-proteins", type=int, default=221)
+    parser.add_argument("--expected-empty-primary-proteins", type=int, default=2)
+    parser.add_argument("--expected-fallback-proteins", type=int, default=223)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    return parser.parse_args()
+
+
+def load_smiles(path: Path) -> dict[str, str]:
+    with path.open("r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise TypeError(f"SMILES file must contain a JSON object: {path}")
+    return {str(key): str(value).strip() for key, value in raw.items()}
+
+
+def load_protein_csv(path: Path) -> dict[str, str]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if not reader.fieldnames or len(reader.fieldnames) < 2:
+            raise ValueError(f"Protein CSV must contain at least two columns: {path}")
+        id_column = "UniProt_ID" if "UniProt_ID" in reader.fieldnames else reader.fieldnames[0]
+        seq_column = "Sequence" if "Sequence" in reader.fieldnames else reader.fieldnames[1]
+        result: dict[str, str] = {}
+        for row in reader:
+            protein_id = str(row[id_column]).strip()
+            if protein_id in result:
+                raise ValueError(f"Duplicate protein ID in {path}: {protein_id}")
+            result[protein_id] = str(row[seq_column]).strip().upper()
+    return result
+
+
+def complete_sequences(
+    primary: dict[str, str], protein_ids: list[str], fallback_path: Path
+) -> tuple[dict[str, str], dict]:
+    """Replace every required empty or non-sequence CSV value from the trusted pickle."""
+
+    result = dict(primary)
+    empty_primary_ids = [protein_id for protein_id in protein_ids if not result.get(protein_id)]
+    invalid_primary_ids = [
+        protein_id
+        for protein_id in protein_ids
+        if result.get(protein_id)
+        and bool(set(result[protein_id]) - SEQUENCE_LETTERS)
+    ]
+    needs_fallback = empty_primary_ids + invalid_primary_ids
+    filled: list[str] = []
+    if needs_fallback:
+        if not fallback_path.exists():
+            raise FileNotFoundError(
+                f"protein_sequences.csv has {len(needs_fallback)} empty/invalid required "
+                "protein values and fallback "
+                f"is absent: {fallback_path}"
+            )
+        with fallback_path.open("rb") as handle:
+            raw = pickle.load(handle, encoding="latin1")
+        if not isinstance(raw, dict):
+            raise TypeError("Protein fallback pickle must contain a dictionary")
+        fallback = {
+            str(key).strip(): "".join(str(value).upper().split())
+            for key, value in raw.items()
+        }
+        for protein_id in needs_fallback:
+            sequence = fallback.get(protein_id, "")
+            if sequence and not (set(sequence) - SEQUENCE_LETTERS):
+                result[protein_id] = sequence
+                filled.append(protein_id)
+    unresolved = [
+        protein_id
+        for protein_id in protein_ids
+        if not result.get(protein_id)
+        or bool(set(result[protein_id]) - SEQUENCE_LETTERS)
+    ]
+    if unresolved:
+        raise ValueError(
+            f"Unresolved empty/invalid local protein IDs after fallback: {unresolved[:10]}"
+        )
+    return result, {
+        "sequence_validation_version": SEQUENCE_VALIDATION_VERSION,
+        "primary_sequence_count": len(protein_ids) - len(needs_fallback),
+        "fallback_sequence_count": len(filled),
+        "fallback_filled_ids": filled,
+        "empty_primary_count": len(empty_primary_ids),
+        "empty_primary_ids": empty_primary_ids,
+        "invalid_primary_count": len(invalid_primary_ids),
+        "invalid_primary_ids": invalid_primary_ids,
+        "unresolved_count": len(unresolved),
+        "invalid_primary_policy": (
+            "replace nonempty CSV cells containing characters outside ASCII A-Z; "
+            "this includes the saved UniProt HTTP/API error messages"
+        ),
+        "fallback_path": str(fallback_path.resolve()),
+    }
+
+
+def load_entity_order(path: Path) -> tuple[list[str], list[str]]:
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if "drug_ids" not in value or "protein_ids" not in value:
+        raise KeyError("entity_order.json must contain drug_ids and protein_ids")
+    drug_ids = [str(item) for item in value["drug_ids"]]
+    protein_ids = [str(item) for item in value["protein_ids"]]
+    if len(drug_ids) != len(set(drug_ids)) or len(protein_ids) != len(set(protein_ids)):
+        raise ValueError("entity_order.json contains duplicate IDs")
+    return drug_ids, protein_ids
+
+
+def main() -> None:
+    args = parse_args()
+    required = [
+        args.entity_order,
+        args.smiles_json,
+        args.protein_csv,
+        args.protein_fallback_pkl,
+        args.mol2vec_model,
+    ]
+    for path in required:
+        if not path.exists():
+            raise FileNotFoundError(path)
+    if min(
+        args.drug_max_tokens,
+        args.functional_group_tokens,
+        args.protein_groups,
+        args.max_residues_per_chunk,
+    ) < 1:
+        raise ValueError("Token/group/chunk sizes must be positive")
+
+    v1, v1_prepare_path = load_v1_prepare(args.v1_dir)
+    drug_ids, protein_ids = load_entity_order(args.entity_order)
+    if len(drug_ids) != args.expected_drugs or len(protein_ids) != args.expected_proteins:
+        raise ValueError(
+            "Entity count mismatch: this script must use the local small dataset, but found "
+            f"drugs={len(drug_ids)}, proteins={len(protein_ids)}; expected "
+            f"{args.expected_drugs}/{args.expected_proteins}."
+        )
+
+    smiles = load_smiles(args.smiles_json)
+    missing_smiles = [drug_id for drug_id in drug_ids if not smiles.get(drug_id)]
+    if missing_smiles:
+        raise ValueError(f"Missing local SMILES: {missing_smiles[:10]}")
+    primary_sequences = load_protein_csv(args.protein_csv)
+    sequences, sequence_sources = complete_sequences(
+        primary_sequences, protein_ids, args.protein_fallback_pkl
+    )
+    expected_sequence_counts = {
+        "primary_sequence_count": args.expected_primary_proteins,
+        "invalid_primary_count": args.expected_invalid_primary_proteins,
+        "empty_primary_count": args.expected_empty_primary_proteins,
+        "fallback_sequence_count": args.expected_fallback_proteins,
+        "unresolved_count": 0,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": sequence_sources.get(key)}
+        for key, expected in expected_sequence_counts.items()
+        if sequence_sources.get(key) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            "Protein sequence audit does not match the locked local707 dataset:\n"
+            + json.dumps(mismatches, indent=2, ensure_ascii=True)
+        )
+    sequence_sources["fallback_sha256"] = v1.sha256_file(args.protein_fallback_pkl)
+    sequences = {protein_id: v1.clean_sequence(sequences[protein_id]) for protein_id in protein_ids}
+    empty = [protein_id for protein_id, sequence in sequences.items() if not sequence]
+    if empty:
+        raise ValueError(f"Empty sequences after V1 cleaning: {empty[:10]}")
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    fine_path = args.output_dir / "v1_finegrained_features.pt"
+    hierarchical_path = args.output_dir / "v1_hierarchical_drug_features.pt"
+    manifest_path = args.output_dir / "v1_aligned_feature_manifest.json"
+    if fine_path.exists() and hierarchical_path.exists() and not args.force:
+        existing_manifest = (
+            json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest_path.exists()
+            else {}
+        )
+        existing_sources = existing_manifest.get("protein_sequence_sources", {})
+        if (
+            existing_sources.get("sequence_validation_version") == SEQUENCE_VALIDATION_VERSION
+            and existing_sources.get("fallback_sequence_count") == args.expected_fallback_proteins
+            and existing_sources.get("invalid_primary_count")
+            == args.expected_invalid_primary_proteins
+            and existing_sources.get("empty_primary_count") == args.expected_empty_primary_proteins
+        ):
+            print(f"Verified sequence-fixed V1 bundles already exist in {args.output_dir}.")
+            return
+        raise FileExistsError(
+            "Existing V1 bundle predates the strict sequence repair or lacks its provenance; "
+            "rerun with --force. Sequence-hash-matching protein caches remain reusable."
+        )
+
+    print("Dataset: local small dataset (not a ColdstartCPI benchmark dataset)")
+    print(f"Entities: drugs={len(drug_ids)}, proteins={len(protein_ids)}")
+    print(
+        "Protein sequence audit: "
+        f"primary={sequence_sources['primary_sequence_count']}, "
+        f"invalid_text={sequence_sources['invalid_primary_count']}, "
+        f"empty={sequence_sources['empty_primary_count']}, "
+        f"fallback={sequence_sources['fallback_sequence_count']}"
+    )
+    print(f"V1 feature implementation: {v1_prepare_path}")
+    drug_tensors, drug_metadata = v1.prepare_drug_features(
+        drug_ids=drug_ids,
+        smiles=smiles,
+        model_path=args.mol2vec_model,
+        max_tokens=args.drug_max_tokens,
+        max_group_tokens=args.functional_group_tokens,
+    )
+
+    precision_key = f"fp16{int(args.fp16)}"
+    cache_dir = (
+        args.output_dir
+        / "cache"
+        / "protein"
+        / f"chunk{args.max_residues_per_chunk}_{precision_key}"
+    )
+    if not args.local_files_only:
+        reset_huggingface_http_client()
+    protein_tensors, protein_metadata = v1.protein_features_from_transformers(
+        protein_ids=protein_ids,
+        sequences=sequences,
+        model_name=PROTEIN_MODEL,
+        groups=args.protein_groups,
+        max_residues=args.max_residues_per_chunk,
+        device_name=args.device,
+        fp16=args.fp16,
+        local_files_only=args.local_files_only,
+        cache_dir=cache_dir,
+    )
+    if tuple(protein_tensors["protein_global"].shape) != (len(protein_ids), 1024):
+        raise RuntimeError("ProtBert-BFD global feature shape is incorrect")
+
+    created = datetime.now(timezone.utc).isoformat()
+    local_feature_code = Path(__file__).resolve()
+    shared_metadata = {
+        "schema_version": 2,
+        "experiment": "local_small_dataset_V1_aligned_features",
+        "created_utc": created,
+        "dataset": "local_707_drug_1489_protein",
+        "uses_dti_labels": False,
+        "uses_relation_graph_features": False,
+        "feature_preparation_code": str(local_feature_code),
+        "feature_preparation_code_sha256": v1.sha256_file(local_feature_code),
+        "v1_feature_code": str(v1_prepare_path.resolve()),
+        "v1_feature_code_sha256": v1.sha256_file(v1_prepare_path),
+        "source_sha256": {
+            "entity_order": v1.sha256_file(args.entity_order),
+            "smiles_json": v1.sha256_file(args.smiles_json),
+            "protein_csv": v1.sha256_file(args.protein_csv),
+            "protein_fallback": sequence_sources["fallback_sha256"],
+            "mol2vec_model": v1.sha256_file(args.mol2vec_model),
+        },
+        "drug_ids_sha256": v1.sha256_strings(drug_ids),
+        "protein_ids_sha256": v1.sha256_strings(protein_ids),
+        "protein_sequences_sha256": v1.sha256_strings(
+            [sequences[protein_id] for protein_id in protein_ids]
+        ),
+        "protein_sequence_sources": sequence_sources,
+        "drug_feature": drug_metadata,
+        "protein_feature": protein_metadata,
+    }
+    fine_bundle = {
+        "drug_ids": drug_ids,
+        "protein_ids": protein_ids,
+        "drug_global": drug_tensors["drug_global"],
+        "drug_local": drug_tensors["drug_local"],
+        "drug_padding_mask": drug_tensors["drug_padding_mask"],
+        "protein_global": protein_tensors["protein_global"],
+        "protein_local": protein_tensors["protein_local"],
+        "protein_padding_mask": protein_tensors["protein_padding_mask"],
+        "metadata": shared_metadata,
+    }
+    hierarchical_bundle = {
+        "drug_ids": drug_ids,
+        "ecfp": drug_tensors["ecfp"],
+        "descriptors": drug_tensors["descriptors"],
+        "functional_group_ids": drug_tensors["functional_group_ids"],
+        "metadata": {
+            **shared_metadata,
+            "feature_bundle": "V1_ECFP_descriptors_functional_groups",
+        },
+    }
+    v1.atomic_torch_save(fine_bundle, fine_path)
+    v1.atomic_torch_save(hierarchical_bundle, hierarchical_path)
+    v1.atomic_json_dump(shared_metadata, manifest_path)
+
+    fine_check = torch_load(fine_path)
+    hierarchical_check = torch_load(hierarchical_path)
+    if [str(value) for value in fine_check["drug_ids"]] != drug_ids:
+        raise RuntimeError("Saved drug order changed")
+    if [str(value) for value in fine_check["protein_ids"]] != protein_ids:
+        raise RuntimeError("Saved protein order changed")
+    if [str(value) for value in hierarchical_check["drug_ids"]] != drug_ids:
+        raise RuntimeError("Saved hierarchical drug order changed")
+    saved_sources = fine_check["metadata"].get("protein_sequence_sources", {})
+    if saved_sources != sequence_sources:
+        raise RuntimeError("Saved protein sequence provenance changed unexpectedly")
+    if not torch.isfinite(fine_check["protein_global"]).all():
+        raise RuntimeError("Saved protein_global contains NaN or infinity")
+    if not torch.isfinite(fine_check["protein_local"].float()).all():
+        raise RuntimeError("Saved protein_local contains NaN or infinity")
+    print(f"Saved fine-grained bundle: {fine_path}")
+    print(f"Saved hierarchical drug bundle: {hierarchical_path}")
+    print(
+        f"Protein global/local: {tuple(fine_check['protein_global'].shape)} / "
+        f"{tuple(fine_check['protein_local'].shape)}"
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-07-13T08:42:35.741024+00:00",
+  "dataset": "BindingDB_AIBind",
+  "fold": 1,
+  "source": {
+    "train": "/mnt/ColdstartCPI/Datasets/BindingDB_AIBind/compound_cold_start/train_set1.csv",
+    "validation": "/mnt/ColdstartCPI/Datasets/BindingDB_AIBind/compound_cold_start/val_set1.csv",
+    "test": "/mnt/ColdstartCPI/Datasets/BindingDB_AIBind/compound_cold_start/test_set1.csv",
+    "train_sha256": "1541726e7c1b4eaf5a39b947cc6399e2c01b16a5e7e2b1bda680eb244b0943a4",
+    "validation_sha256": "ec0f75d798fda58d901329cf772d739bafb78bc5f285c8955c8a890d3eb83c81",
+    "test_sha256": "d2e57a518c0aea4f3eb2deb0a35d5b9b9ac69c815e32fbe00adf7a9b097855b0",
+    "feature_bundle": "/mnt/ColdstartCPI/V1/features/BindingDB_AIBind/v1_features.pt",
+    "feature_sha256": "f68bec0a35d18f4b7915a1cc59057acc97b214cff6d5775e2474dbc8114b1a7a"
+  },
+  "protocol": {
+    "author_scenario": "S2 compound_cold_start",
+    "test_drug_set_preserved": true,
+    "author_train_and_validation_merged_before_cold_validation_rebuild": true,
+    "cold_validation_fraction": 0.1,
+    "strict_protein_known": false,
+    "author_test_proteins_not_in_rebuilt_train": 23,
+    "extra_negative_semantics": "unlabeled compound-protein pairs treated as negatives",
+    "negative_pools_are_nested": true,
+    "evaluation_ratios": [
+      1,
+      2,
+      5,
+      10,
+      20,
+      50,
+      100
+    ]
+  },
+  "counts": {
+    "train_drugs": 4921,
+    "validation_drugs": 510,
+    "test_drugs": 1357,
+    "train_proteins": 4444,
+    "evaluation_proteins": 4472,
+    "train_positive": 14179,
+    "validation_positive": 1575,
+    "test_positive": 3858,
+    "author_test_positive_before_protein_filter": 3858,
+    "global_known_positive": 19612
+  },
+  "negative_sources": {
+    "train": {
+      "requested": 28358,
+      "author_labeled_negatives": 22343,
+      "sampled_unlabeled_as_negative": 6015,
+      "ordering": "shuffled author negatives first, then shuffled unlabeled pairs"
+    },
+    "validation": {
+      "requested": 157500,
+      "author_labeled_negatives": 2252,
+      "sampled_unlabeled_as_negative": 155248,
+      "ordering": "shuffled author negatives first, then shuffled unlabeled pairs"
+    },
+    "test": {
+      "requested": 385800,
+      "author_labeled_negatives": 6083,
+      "sampled_unlabeled_as_negative": 379717,
+      "ordering": "shuffled author negatives first, then shuffled unlabeled pairs"
+    }
+  },
+  "official_feature_missing_entities_removed": true
+}

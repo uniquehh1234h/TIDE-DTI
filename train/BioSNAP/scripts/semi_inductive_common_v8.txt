@@ -1,0 +1,825 @@
+from __future__ import annotations
+
+import copy
+import random
+from pathlib import Path
+from typing import Callable, Dict, Iterable
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    fbeta_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from torch_geometric.data import HeteroData
+from torch_geometric.nn import HeteroConv, LayerNorm, SAGEConv
+
+
+TARGET_FWD = ("drug", "interacts", "protein")
+TARGET_REV = ("protein", "rev_interacts", "drug")
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def fold_number_from_path(path: Path) -> int:
+    return int(path.stem.replace("split_fold", ""))
+
+
+def load_list(path: Path) -> list[str]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+def sorted_ids_from_map(mapping: dict) -> list[str]:
+    return [str(k) for k, _ in sorted(mapping.items(), key=lambda kv: kv[1])]
+
+
+def expected_ids(saved: dict, data_dir: Path) -> tuple[list[str], list[str]]:
+    drug_map = saved.get("drug_map")
+    prot_map = saved.get("prot_map")
+    if drug_map is not None:
+        drug_ids = sorted_ids_from_map(drug_map)
+    else:
+        drug_ids = load_list(data_dir / "Dataset_drug_list.txt")
+    if prot_map is not None:
+        protein_ids = sorted_ids_from_map(prot_map)
+    else:
+        protein_ids = load_list(data_dir / "Dataset_protein_list.txt")
+    return drug_ids, protein_ids
+
+
+def ids_to_set(ids: Iterable[int] | torch.Tensor | np.ndarray) -> set[int]:
+    if isinstance(ids, torch.Tensor):
+        return set(ids.detach().cpu().long().tolist())
+    return set(np.asarray(list(ids), dtype=np.int64).tolist())
+
+
+def ids_to_numpy(ids: Iterable[int] | torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(ids, torch.Tensor):
+        return ids.detach().cpu().long().numpy()
+    return np.asarray(list(ids), dtype=np.int64)
+
+
+def edge_set(edge_index: torch.Tensor) -> set[tuple[int, int]]:
+    edge_index = edge_index.detach().cpu()
+    if edge_index.numel() == 0:
+        return set()
+    return set(zip(edge_index[0].tolist(), edge_index[1].tolist()))
+
+
+def empty_edges() -> torch.Tensor:
+    return torch.empty((2, 0), dtype=torch.long)
+
+
+def edges_from_pairs(pairs: list[tuple[int, int]]) -> torch.Tensor:
+    if not pairs:
+        return empty_edges()
+    return torch.tensor(pairs, dtype=torch.long).t().contiguous()
+
+
+def select_edges(
+    pos_edges: torch.Tensor,
+    drug_ids: Iterable[int] | torch.Tensor | np.ndarray,
+    protein_ids: Iterable[int] | torch.Tensor | np.ndarray | None = None,
+) -> torch.Tensor:
+    drugs = ids_to_set(drug_ids)
+    proteins = None if protein_ids is None else ids_to_set(protein_ids)
+    pairs = []
+    for d, p in zip(pos_edges[0].tolist(), pos_edges[1].tolist()):
+        if d not in drugs:
+            continue
+        if proteins is not None and p not in proteins:
+            continue
+        pairs.append((int(d), int(p)))
+    return edges_from_pairs(pairs)
+
+
+def unique_ids_from_edges(edge_index: torch.Tensor, row: int) -> np.ndarray:
+    if edge_index.numel() == 0:
+        return np.asarray([], dtype=np.int64)
+    return np.unique(edge_index[row].detach().cpu().long().numpy())
+
+
+def count_available_negative_pairs(
+    drug_ids: Iterable[int] | torch.Tensor | np.ndarray,
+    protein_ids: Iterable[int] | torch.Tensor | np.ndarray,
+    forbidden_pairs: set[tuple[int, int]],
+) -> int:
+    drugs = ids_to_set(drug_ids)
+    proteins = ids_to_set(protein_ids)
+    total = len(drugs) * len(proteins)
+    blocked = sum(1 for d, p in forbidden_pairs if d in drugs and p in proteins)
+    return max(0, total - blocked)
+
+
+def sample_negative_edges(
+    drug_ids: Iterable[int] | torch.Tensor | np.ndarray,
+    protein_ids: Iterable[int] | torch.Tensor | np.ndarray,
+    forbidden_pairs: set[tuple[int, int]],
+    num_neg: int,
+    seed: int,
+) -> torch.Tensor:
+    drug_arr = ids_to_numpy(drug_ids)
+    prot_arr = ids_to_numpy(protein_ids)
+    if num_neg <= 0:
+        return empty_edges()
+    if len(drug_arr) == 0 or len(prot_arr) == 0:
+        raise ValueError("Cannot sample negatives from an empty drug/protein set.")
+    available = count_available_negative_pairs(drug_arr, prot_arr, forbidden_pairs)
+    if num_neg > available:
+        raise ValueError(
+            f"Not enough candidate negatives: need {num_neg}, available {available}. "
+            "For semi-inductive folds this usually means the held-out drug fold is too small "
+            "for the requested max eval ratio."
+        )
+
+    rng = np.random.default_rng(seed)
+    selected: set[tuple[int, int]] = set()
+    attempts = 0
+    max_attempts = max(10000, num_neg * 100)
+    batch_size = min(max(num_neg * 2, 1024), 200000)
+    while len(selected) < num_neg and attempts < max_attempts:
+        d_batch = rng.choice(drug_arr, size=batch_size, replace=True)
+        p_batch = rng.choice(prot_arr, size=batch_size, replace=True)
+        for d, p in zip(d_batch.tolist(), p_batch.tolist()):
+            pair = (int(d), int(p))
+            if pair not in forbidden_pairs and pair not in selected:
+                selected.add(pair)
+                if len(selected) == num_neg:
+                    break
+        attempts += batch_size
+
+    if len(selected) < num_neg:
+        all_pairs = [(int(d), int(p)) for d in drug_arr.tolist() for p in prot_arr.tolist()]
+        rng.shuffle(all_pairs)
+        for pair in all_pairs:
+            if pair not in forbidden_pairs and pair not in selected:
+                selected.add(pair)
+                if len(selected) == num_neg:
+                    break
+
+    return edges_from_pairs(list(selected))
+
+
+def require_no_overlap(name_a: str, values_a: Iterable[int], name_b: str, values_b: Iterable[int]) -> None:
+    overlap = ids_to_set(values_a) & ids_to_set(values_b)
+    if overlap:
+        raise ValueError(f"{name_a} and {name_b} overlap: {len(overlap)} ids")
+
+
+def require_edges_subset(name: str, edges: torch.Tensor, drug_ids: Iterable[int], protein_ids: Iterable[int]) -> None:
+    drugs = ids_to_set(drug_ids)
+    proteins = ids_to_set(protein_ids)
+    bad = [(d, p) for d, p in edge_set(edges) if d not in drugs or p not in proteins]
+    if bad:
+        raise ValueError(f"{name} contains edges outside the expected drug/protein set: {len(bad)}")
+
+
+def require_no_positive_collision(name: str, neg_edges: torch.Tensor, global_pos_set: set[tuple[int, int]]) -> None:
+    collision = edge_set(neg_edges) & global_pos_set
+    if collision:
+        raise ValueError(f"{name} contains known positive pairs: {len(collision)}")
+
+
+def require_no_duplicates(name: str, edges: torch.Tensor) -> None:
+    pairs = edge_set(edges)
+    if len(pairs) != edges.size(1):
+        raise ValueError(f"{name} contains duplicate pairs: {edges.size(1) - len(pairs)}")
+
+
+def validate_semi_split(split: dict, global_pos_set: set[tuple[int, int]], fold: int) -> None:
+    required = [
+        "pos_tr",
+        "pos_val",
+        "test_pos",
+        "neg_tr",
+        "neg_val_es",
+        "neg_te",
+        "val_neg_pool",
+        "test_neg_pool",
+        "train_drugs",
+        "val_drugs",
+        "test_drugs",
+        "train_proteins",
+    ]
+    missing = [key for key in required if key not in split]
+    if missing:
+        raise KeyError(f"split_fold{fold} missing keys: {missing}")
+
+    train_drugs = split["train_drugs"]
+    val_drugs = split["val_drugs"]
+    test_drugs = split["test_drugs"]
+    train_proteins = split["train_proteins"]
+    require_no_overlap("train_drugs", train_drugs, "val_drugs", val_drugs)
+    require_no_overlap("train_drugs", train_drugs, "test_drugs", test_drugs)
+    require_no_overlap("val_drugs", val_drugs, "test_drugs", test_drugs)
+
+    require_edges_subset("pos_tr", split["pos_tr"], train_drugs, train_proteins)
+    require_edges_subset("pos_val", split["pos_val"], val_drugs, train_proteins)
+    require_edges_subset("test_pos", split["test_pos"], test_drugs, train_proteins)
+    require_edges_subset("neg_tr", split["neg_tr"], train_drugs, train_proteins)
+    require_edges_subset("neg_val_es", split["neg_val_es"], val_drugs, train_proteins)
+    require_edges_subset("neg_te", split["neg_te"], test_drugs, train_proteins)
+    require_edges_subset("val_neg_pool", split["val_neg_pool"], val_drugs, train_proteins)
+    require_edges_subset("test_neg_pool", split["test_neg_pool"], test_drugs, train_proteins)
+
+    for key in ["neg_tr", "neg_val_es", "neg_te", "val_neg_pool", "test_neg_pool"]:
+        require_no_positive_collision(key, split[key], global_pos_set)
+        require_no_duplicates(key, split[key])
+
+
+def make_degree_balanced_drug_chunks(
+    pos_edges: torch.Tensor,
+    active_drugs: np.ndarray,
+    cv_folds: int,
+    seed: int,
+) -> tuple[list[np.ndarray], list[int]]:
+    """Split drug IDs into equally sized folds with balanced positive-edge counts."""
+    degree = {int(drug): 0 for drug in active_drugs.tolist()}
+    for drug in pos_edges[0].tolist():
+        drug_id = int(drug)
+        if drug_id in degree:
+            degree[drug_id] += 1
+
+    rng = np.random.default_rng(seed)
+    # Randomize only equal-degree ties, then assign high-degree drugs greedily.
+    shuffled = rng.permutation(active_drugs).tolist()
+    ordered_drugs = sorted(shuffled, key=lambda drug: degree[int(drug)], reverse=True)
+
+    base_size, remainder = divmod(len(active_drugs), cv_folds)
+    capacities = [base_size + (1 if fold < remainder else 0) for fold in range(cv_folds)]
+    chunks: list[list[int]] = [[] for _ in range(cv_folds)]
+    edge_totals = [0 for _ in range(cv_folds)]
+
+    for drug in ordered_drugs:
+        eligible = [fold for fold in range(cv_folds) if len(chunks[fold]) < capacities[fold]]
+        target = min(eligible, key=lambda fold: (edge_totals[fold], len(chunks[fold]), fold))
+        drug_id = int(drug)
+        chunks[target].append(drug_id)
+        edge_totals[target] += degree[drug_id]
+
+    return [np.asarray(chunk, dtype=np.int64) for chunk in chunks], edge_totals
+
+
+def create_or_load_semi_inductive_splits(
+    pos_edges: torch.Tensor,
+    split_cache_dir: Path,
+    cv_folds: int,
+    seed: int,
+    neg_ratio: float,
+    eval_ratios: list[int],
+    force_rebuild: bool = False,
+) -> list[Path]:
+    split_cache_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(split_cache_dir.glob("split_fold*.pt"), key=fold_number_from_path)
+    expected_names = [f"split_fold{fold}.pt" for fold in range(1, cv_folds + 1)]
+    if existing and not force_rebuild:
+        cache_matches = [path.name for path in existing] == expected_names
+        if cache_matches:
+            try:
+                for path in existing:
+                    cached = torch.load(path, map_location="cpu", weights_only=False)
+                    cache_matches = (
+                        cached.get("protocol") == "semi_inductive_drug_cold_protein_known"
+                        and cached.get("drug_split_strategy") == "positive_degree_balanced_drug_cold_cv"
+                        and int(cached.get("cv_folds", -1)) == cv_folds
+                        and int(cached.get("seed", -1)) == seed
+                        and float(cached.get("neg_ratio", -1.0)) == float(neg_ratio)
+                        and list(cached.get("eval_ratios", [])) == list(eval_ratios)
+                    )
+                    if not cache_matches:
+                        break
+            except Exception:
+                cache_matches = False
+        if cache_matches:
+            return existing
+        print("Existing semi-inductive split cache is incomplete or incompatible; rebuilding it.")
+    for path in existing:
+        path.unlink()
+
+    global_pos_set = edge_set(pos_edges)
+    active_drugs = unique_ids_from_edges(pos_edges, row=0)
+    if len(active_drugs) < cv_folds:
+        raise ValueError(f"Active drugs={len(active_drugs)} < cv_folds={cv_folds}")
+
+    drug_chunks, fold_positive_counts = make_degree_balanced_drug_chunks(
+        pos_edges=pos_edges,
+        active_drugs=active_drugs,
+        cv_folds=cv_folds,
+        seed=seed,
+    )
+    max_ratio = max(eval_ratios)
+    saved_paths: list[Path] = []
+
+    for fold_idx in range(cv_folds):
+        fold = fold_idx + 1
+        test_drugs = drug_chunks[fold_idx]
+        val_drugs = drug_chunks[(fold_idx + 1) % cv_folds]
+        train_drugs = np.concatenate(
+            [chunk for i, chunk in enumerate(drug_chunks) if i not in {fold_idx, (fold_idx + 1) % cv_folds}]
+        ).astype(np.int64)
+
+        pos_tr = select_edges(pos_edges, train_drugs)
+        train_proteins = unique_ids_from_edges(pos_tr, row=1)
+        raw_pos_val = select_edges(pos_edges, val_drugs)
+        raw_test_pos = select_edges(pos_edges, test_drugs)
+        pos_val = select_edges(pos_edges, val_drugs, train_proteins)
+        test_pos = select_edges(pos_edges, test_drugs, train_proteins)
+        dropped_val = raw_pos_val.size(1) - pos_val.size(1)
+        dropped_test = raw_test_pos.size(1) - test_pos.size(1)
+
+        if pos_tr.size(1) == 0 or pos_val.size(1) == 0 or test_pos.size(1) == 0:
+            raise ValueError(
+                f"Fold {fold} has an empty train/val/test positive set after known-protein filtering: "
+                f"train={pos_tr.size(1)}, val={pos_val.size(1)}, test={test_pos.size(1)}"
+            )
+
+        val_neg_pool = sample_negative_edges(
+            val_drugs,
+            train_proteins,
+            global_pos_set,
+            int(pos_val.size(1) * max_ratio),
+            seed + fold * 1000 + 11,
+        )
+        test_neg_pool = sample_negative_edges(
+            test_drugs,
+            train_proteins,
+            global_pos_set,
+            int(test_pos.size(1) * max_ratio),
+            seed + fold * 1000 + 23,
+        )
+        neg_val_es = val_neg_pool[:, : int(pos_val.size(1) * neg_ratio)].clone()
+        neg_te = test_neg_pool[:, : int(test_pos.size(1) * neg_ratio)].clone()
+
+        forbidden_train = global_pos_set | edge_set(val_neg_pool) | edge_set(test_neg_pool)
+        neg_tr = sample_negative_edges(
+            train_drugs,
+            train_proteins,
+            forbidden_train,
+            int(pos_tr.size(1) * neg_ratio),
+            seed + fold * 1000 + 37,
+        )
+
+        split = {
+            "protocol": "semi_inductive_drug_cold_protein_known",
+            "drug_split_strategy": "positive_degree_balanced_drug_cold_cv",
+            "fold": fold,
+            "seed": seed,
+            "cv_folds": cv_folds,
+            "fold_positive_counts": list(fold_positive_counts),
+            "neg_ratio": float(neg_ratio),
+            "eval_ratios": list(eval_ratios),
+            "train_drugs": torch.as_tensor(train_drugs, dtype=torch.long),
+            "val_drugs": torch.as_tensor(val_drugs, dtype=torch.long),
+            "test_drugs": torch.as_tensor(test_drugs, dtype=torch.long),
+            "train_proteins": torch.as_tensor(train_proteins, dtype=torch.long),
+            "pos_tr": pos_tr.cpu(),
+            "pos_val": pos_val.cpu(),
+            "test_pos": test_pos.cpu(),
+            "neg_tr": neg_tr.cpu(),
+            "neg_val_es": neg_val_es.cpu(),
+            "neg_te": neg_te.cpu(),
+            "val_neg_pool": val_neg_pool.cpu(),
+            "test_neg_pool": test_neg_pool.cpu(),
+            "dropped_val_positive_unknown_protein": int(dropped_val),
+            "dropped_test_positive_unknown_protein": int(dropped_test),
+        }
+        validate_semi_split(split, global_pos_set, fold)
+        path = split_cache_dir / f"split_fold{fold}.pt"
+        torch.save(split, path)
+        saved_paths.append(path)
+        print(
+            f"Saved fold {fold}: train_pos={pos_tr.size(1)}, val_pos={pos_val.size(1)}, "
+            f"test_pos={test_pos.size(1)}, dropped_val={dropped_val}, dropped_test={dropped_test}"
+        )
+
+    return saved_paths
+
+
+def compute_metrics(labels: np.ndarray, probs: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    preds = (probs >= threshold).astype(int)
+    return {
+        "Accuracy": accuracy_score(labels, preds),
+        "Precision": precision_score(labels, preds, zero_division=0),
+        "Recall": recall_score(labels, preds, zero_division=0),
+        "F1": f1_score(labels, preds, zero_division=0),
+        "MCC": matthews_corrcoef(labels, preds),
+        "AUC": roc_auc_score(labels, probs) if len(np.unique(labels)) > 1 else 0.5,
+        "AUPR": average_precision_score(labels, probs) if len(np.unique(labels)) > 1 else 0.0,
+    }
+
+
+def find_best_threshold_fbeta(labels: np.ndarray, probs: np.ndarray, beta: float = 0.5) -> float:
+    best_t = 0.5
+    best_score = -1.0
+    for threshold in np.arange(0.05, 0.96, 0.01):
+        preds = (probs >= threshold).astype(int)
+        score = fbeta_score(labels, preds, beta=beta, zero_division=0)
+        if score > best_score:
+            best_score = score
+            best_t = threshold
+    return float(best_t)
+
+
+def evaluate_ratios_with_score_fn(
+    score_edges_fn: Callable[[torch.Tensor], torch.Tensor],
+    pos_val: torch.Tensor,
+    val_neg_pool: torch.Tensor,
+    test_pos: torch.Tensor,
+    test_neg_pool: torch.Tensor,
+    eval_ratios: list[int],
+    device: torch.device,
+) -> pd.DataFrame:
+    val_pos_num = pos_val.size(1)
+    test_pos_num = test_pos.size(1)
+    rows = []
+    with torch.no_grad():
+        val_pos_probs = score_edges_fn(pos_val.to(device)).detach().cpu().numpy()
+        test_pos_probs = score_edges_fn(test_pos.to(device)).detach().cpu().numpy()
+
+    for ratio in eval_ratios:
+        num_val_neg = int(val_pos_num * ratio)
+        num_test_neg = int(test_pos_num * ratio)
+        if num_val_neg > val_neg_pool.size(1):
+            raise ValueError(f"val_neg_pool has {val_neg_pool.size(1)} negatives, need {num_val_neg}")
+        if num_test_neg > test_neg_pool.size(1):
+            raise ValueError(f"test_neg_pool has {test_neg_pool.size(1)} negatives, need {num_test_neg}")
+        with torch.no_grad():
+            val_neg_probs = score_edges_fn(val_neg_pool[:, :num_val_neg].to(device)).detach().cpu().numpy()
+            test_neg_probs = score_edges_fn(test_neg_pool[:, :num_test_neg].to(device)).detach().cpu().numpy()
+
+        val_probs = np.concatenate([val_pos_probs, val_neg_probs])
+        val_labels = np.concatenate([np.ones(val_pos_num), np.zeros(num_val_neg)])
+        test_probs = np.concatenate([test_pos_probs, test_neg_probs])
+        test_labels = np.concatenate([np.ones(test_pos_num), np.zeros(num_test_neg)])
+        best_t = find_best_threshold_fbeta(val_labels, val_probs, beta=0.5)
+        metrics = compute_metrics(test_labels, test_probs, threshold=best_t)
+        metrics["Ratio"] = f"1:{ratio}"
+        metrics["Opt_Thresh"] = best_t
+        rows.append(metrics)
+        print(f"  Ratio 1:{ratio:<4} | Thr={best_t:.3f} | AUPR={metrics['AUPR']:.4f}")
+    return pd.DataFrame(rows)
+
+
+class DeepGatedInteraction(nn.Module):
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.gate = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.Sigmoid())
+        self.inter_fc1 = nn.Linear(hidden, hidden * 2)
+        self.inter_fc2 = nn.Linear(hidden * 2, hidden)
+        self.act = nn.GELU()
+        self.norm = nn.LayerNorm(hidden)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, zd: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
+        inter_base = zd * zp
+        gate = self.gate(torch.cat([zd, zp], dim=-1))
+        gated_inter = inter_base * gate
+        x = self.dropout(self.act(self.inter_fc1(gated_inter)))
+        x = self.inter_fc2(x)
+        return self.norm(gated_inter + x)
+
+
+class EvidentialDTIModel(nn.Module):
+    def __init__(self, hidden: int, metadata, num_layers: int = 2) -> None:
+        super().__init__()
+        self.convs = nn.ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(
+                HeteroConv({edge_type: SAGEConv((-1, -1), hidden) for edge_type in metadata[1]}, aggr="sum")
+            )
+        self.norms = nn.ModuleList([LayerNorm(hidden) for _ in range(num_layers)])
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden, 1),
+        )
+        self.meta_interaction = DeepGatedInteraction(hidden)
+        self.evidence_generator = nn.Sequential(
+            nn.Linear(hidden * 3, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2),
+            nn.Softplus(),
+        )
+
+    def encode(self, x_dict: Dict[str, torch.Tensor], edge_index_dict: Dict[tuple, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        for i, conv in enumerate(self.convs):
+            x_dict = conv(x_dict, edge_index_dict)
+            x_dict = {key: F.elu(self.norms[i](value)) for key, value in x_dict.items()}
+        return x_dict
+
+    def decode(self, z_d: torch.Tensor, z_p: torch.Tensor, edge_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        zd = z_d[edge_index[0]]
+        zp = z_p[edge_index[1]]
+        inter = self.meta_interaction(zd, zp)
+        pair_feat = torch.cat([zd, zp, inter], dim=-1)
+        logit = self.decoder(pair_feat).squeeze(-1)
+        alpha = self.evidence_generator(pair_feat) + 1.0
+        return logit, alpha
+
+
+class PretrainedSemanticDTIModel(nn.Module):
+    def __init__(self, drug_dim: int, protein_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.drug_adapter = nn.Sequential(nn.Linear(drug_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.2))
+        self.protein_adapter = nn.Sequential(
+            nn.Linear(protein_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(0.2),
+        )
+        self.interaction = DeepGatedInteraction(hidden)
+        self.decoder = nn.Sequential(nn.Linear(hidden * 3, hidden), nn.ReLU(), nn.Dropout(0.2), nn.Linear(hidden, 1))
+        self.evidence_generator = nn.Sequential(nn.Linear(hidden * 3, hidden), nn.ReLU(), nn.Linear(hidden, 2), nn.Softplus())
+
+    def encode_all(self, drug_raw: torch.Tensor, protein_raw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.drug_adapter(drug_raw), self.protein_adapter(protein_raw)
+
+    def decode_from_hidden(
+        self,
+        drug_h: torch.Tensor,
+        protein_h: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zd = drug_h[edge_index[0]]
+        zp = protein_h[edge_index[1]]
+        inter = self.interaction(zd, zp)
+        pair_feat = torch.cat([zd, zp, inter], dim=-1)
+        logit = self.decoder(pair_feat).squeeze(-1)
+        alpha = self.evidence_generator(pair_feat) + 1.0
+        return logit, alpha
+
+    def decode(
+        self,
+        drug_raw: torch.Tensor,
+        protein_raw: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        drug_h, protein_h = self.encode_all(drug_raw, protein_raw)
+        return self.decode_from_hidden(drug_h, protein_h, edge_index)
+
+
+class FusionHead(nn.Module):
+    def __init__(self, hidden: int, sem_drug_dim: int, sem_prot_dim: int) -> None:
+        super().__init__()
+        self.drug_sem_adapter = nn.Sequential(nn.Linear(sem_drug_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.2))
+        self.prot_sem_adapter = nn.Sequential(nn.Linear(sem_prot_dim, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.2))
+        self.struct_interaction = DeepGatedInteraction(hidden)
+        self.sem_interaction = DeepGatedInteraction(hidden)
+        self.struct_proj = nn.Sequential(nn.Linear(hidden * 3, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.2))
+        self.sem_proj = nn.Sequential(nn.Linear(hidden * 3, hidden), nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(0.2))
+        self.gate = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.Sigmoid())
+        self.decoder = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(0.2), nn.Linear(hidden, 1))
+        self.evidence_generator = nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, 2), nn.Softplus())
+        nn.init.constant_(self.gate[2].bias, 1.0)
+
+    def build_pair(
+        self,
+        drug_x: torch.Tensor,
+        protein_x: torch.Tensor,
+        edge_index: torch.Tensor,
+        interaction: nn.Module,
+    ) -> torch.Tensor:
+        drug_feat = drug_x[edge_index[0]]
+        protein_feat = protein_x[edge_index[1]]
+        inter_feat = interaction(drug_feat, protein_feat)
+        return torch.cat([drug_feat, protein_feat, inter_feat], dim=-1)
+
+    def forward(
+        self,
+        struct_drug: torch.Tensor,
+        struct_protein: torch.Tensor,
+        sem_drug_raw: torch.Tensor,
+        sem_protein_raw: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sem_drug = self.drug_sem_adapter(sem_drug_raw)
+        sem_protein = self.prot_sem_adapter(sem_protein_raw)
+        struct_h = self.struct_proj(self.build_pair(struct_drug, struct_protein, edge_index, self.struct_interaction))
+        sem_h = self.sem_proj(self.build_pair(sem_drug, sem_protein, edge_index, self.sem_interaction))
+        gate = self.gate(torch.cat([struct_h, sem_h], dim=-1))
+        fused = gate * struct_h + (1.0 - gate) * sem_h
+        logit = self.decoder(fused).squeeze(-1)
+        alpha = self.evidence_generator(fused) + 1.0
+        return logit, alpha
+
+
+def evidential_loss(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    labels: torch.Tensor,
+    epoch: int,
+    total_epochs: int,
+    pos_weight_value: float,
+    kl_lambda: float,
+    pos_conf_lambda: float,
+) -> torch.Tensor:
+    eps = 1e-7
+    pos_weight = torch.tensor(pos_weight_value, device=logits.device)
+    bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none", pos_weight=pos_weight)
+    s_detached = alpha.sum(dim=1).detach()
+    bce_loss = (bce * s_detached / (s_detached.mean() + eps)).mean()
+
+    warmup = min(1.0, epoch / (total_epochs * 0.4))
+    a_sum = alpha.sum(dim=1, keepdim=True)
+    kl = (torch.lgamma(a_sum + eps) - torch.lgamma(alpha + eps).sum(dim=1, keepdim=True)).squeeze()
+    kl_loss = (kl * (labels == 0).float()).mean()
+
+    pos_mask = (labels == 1).float()
+    s_full = alpha.sum(dim=1)
+    pos_edl = torch.digamma(s_full + eps) - torch.digamma(alpha[:, 1] + eps)
+    pos_conf_loss = (pos_edl * pos_mask).sum() / (pos_mask.sum() + eps)
+    return bce_loss + warmup * kl_lambda * kl_loss + warmup * pos_conf_lambda * pos_conf_loss
+
+
+def filter_edge_index_by_visible_drugs(
+    edge_index: torch.Tensor,
+    edge_type: tuple,
+    visible_drugs: torch.Tensor | None,
+) -> torch.Tensor:
+    if visible_drugs is None or "drug" not in edge_type:
+        return edge_index
+    visible_drugs = visible_drugs.to(edge_index.device)
+    mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+    if edge_type[0] == "drug":
+        mask = mask & torch.isin(edge_index[0], visible_drugs)
+    if edge_type[2] == "drug":
+        mask = mask & torch.isin(edge_index[1], visible_drugs)
+    return edge_index[:, mask]
+
+
+def build_safe_edge_index_dict(
+    data: HeteroData,
+    pos_tr: torch.Tensor,
+    visible_drugs: torch.Tensor | None = None,
+) -> dict:
+    safe = {}
+    for rel in data.edge_types:
+        if rel == TARGET_FWD:
+            safe[rel] = pos_tr
+        elif rel == TARGET_REV:
+            safe[rel] = pos_tr.flip(0)
+        else:
+            safe[rel] = filter_edge_index_by_visible_drugs(data[rel].edge_index, rel, visible_drugs)
+    return safe
+
+
+def make_fold_data(base_data: HeteroData, safe_edge_index_dict: dict, hidden_dim: int, device: torch.device) -> HeteroData:
+    fold_data = HeteroData()
+    for node_type in base_data.node_types:
+        if "x" in base_data[node_type] and base_data[node_type].x is not None:
+            fold_data[node_type].x = base_data[node_type].x
+        else:
+            fold_data[node_type].x = torch.zeros(
+                (base_data[node_type].num_nodes, hidden_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+        fold_data[node_type].num_nodes = base_data[node_type].num_nodes
+    for rel in base_data.edge_types:
+        fold_data[rel].edge_index = safe_edge_index_dict[rel]
+    return fold_data
+
+
+def build_dynamic_train_edges(
+    pos_tr: torch.Tensor,
+    train_drugs: torch.Tensor,
+    train_proteins: torch.Tensor,
+    forbidden_pairs: set[tuple[int, int]],
+    score_edges_fn: Callable[[torch.Tensor], torch.Tensor],
+    device: torch.device,
+    seed: int,
+    hard_neg_pool: int,
+    random_neg_num: int,
+    hard_neg_num: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    random_requested = int(random_neg_num)
+    hard_requested = int(hard_neg_num)
+    if random_requested < 0 or hard_requested < 0:
+        raise ValueError("Requested random and hard negative counts must be non-negative.")
+
+    available = count_available_negative_pairs(train_drugs, train_proteins, forbidden_pairs)
+    pool_size = min(int(hard_neg_pool), available)
+    if pool_size <= 0:
+        raise ValueError("No available negatives for dynamic hard-negative mining.")
+    required_total = random_requested + hard_requested
+    if hard_requested > 0 and pool_size <= required_total:
+        raise ValueError(
+            "Dynamic hard-negative candidate pool must be strictly larger than the requested "
+            f"random+hard set for real top-k mining: pool={pool_size}, "
+            f"random={random_requested}, hard={hard_requested}. "
+            "Increase --hard-neg-pool or lower the requested negative counts."
+        )
+    if hard_requested == 0 and pool_size < random_requested:
+        raise ValueError(
+            "Dynamic negative candidate pool is smaller than the requested random set: "
+            f"pool={pool_size}, random={random_requested}. "
+            "Increase --hard-neg-pool or lower the requested negative count."
+        )
+
+    candidate = sample_negative_edges(train_drugs, train_proteins, forbidden_pairs, pool_size, seed).to(device)
+    torch.manual_seed(seed)
+    perm = torch.randperm(candidate.size(1), device=device)
+    candidate = candidate[:, perm]
+
+    num_rand = random_requested
+    rand_neg = candidate[:, :num_rand]
+    remain = candidate[:, num_rand:]
+
+    num_hard = hard_requested
+    if num_hard > 0:
+        scores = []
+        with torch.no_grad():
+            for start in range(0, remain.size(1), 5000):
+                batch = remain[:, start : start + 5000]
+                scores.append(score_edges_fn(batch).detach())
+        _, hard_idx = torch.topk(torch.cat(scores), k=num_hard)
+        hard_neg = remain[:, hard_idx]
+    else:
+        hard_neg = torch.empty((2, 0), dtype=torch.long, device=device)
+
+    train_idx = torch.cat([pos_tr, rand_neg, hard_neg], dim=1)
+    train_lab = torch.cat(
+        [
+            torch.ones(pos_tr.size(1), device=device),
+            torch.zeros(rand_neg.size(1), device=device),
+            torch.zeros(hard_neg.size(1), device=device),
+        ]
+    )
+    return train_idx, train_lab
+
+
+def load_pretrained_embeddings(
+    pretrained_path: Path,
+    saved_graph: dict,
+    data_dir: Path,
+    num_drugs: int,
+    num_proteins: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not pretrained_path.exists():
+        raise FileNotFoundError(f"Missing pretrained semantic embedding file: {pretrained_path}")
+    sem = torch.load(pretrained_path, map_location="cpu", weights_only=False)
+    required = ["drug_sem", "protein_sem", "drug_ids", "protein_ids", "drug_model", "protein_model"]
+    missing = [key for key in required if key not in sem]
+    if missing:
+        raise KeyError(f"Semantic file {pretrained_path} missing keys: {missing}")
+
+    drug_sem = sem["drug_sem"].float()
+    protein_sem = sem["protein_sem"].float()
+    if drug_sem.size(0) != num_drugs or protein_sem.size(0) != num_proteins:
+        raise ValueError(
+            f"Semantic shape mismatch: drug {tuple(drug_sem.shape)} vs {num_drugs}, "
+            f"protein {tuple(protein_sem.shape)} vs {num_proteins}"
+        )
+
+    expected_drug_ids, expected_protein_ids = expected_ids(saved_graph, data_dir)
+    if [str(x) for x in sem["drug_ids"]] != expected_drug_ids:
+        raise ValueError("drug_ids in pretrained semantic file are not aligned with graph drug order")
+    if [str(x) for x in sem["protein_ids"]] != expected_protein_ids:
+        raise ValueError("protein_ids in pretrained semantic file are not aligned with graph protein order")
+
+    print(f"Pretrained drug model: {sem['drug_model']}")
+    print(f"Pretrained protein model: {sem['protein_model']}")
+    print(f"Pretrained shapes: drug={tuple(drug_sem.shape)}, protein={tuple(protein_sem.shape)}")
+    return drug_sem, protein_sem
+
+
+def summarize_ratio_results(all_ratio_df: pd.DataFrame) -> pd.DataFrame:
+    metric_cols = ["Accuracy", "Precision", "Recall", "F1", "MCC", "AUC", "AUPR", "Opt_Thresh"]
+    rows = []
+    for ratio, group in all_ratio_df.groupby("Ratio", sort=False):
+        row = {"Ratio": ratio}
+        for metric in metric_cols:
+            row[f"{metric}_mean"] = group[metric].mean()
+            row[f"{metric}_std"] = group[metric].std(ddof=1)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def save_result_tables(save_dir: Path, prefix: str, cv_rows: list[dict], ratio_dfs: list[pd.DataFrame]) -> None:
+    cv_df = pd.DataFrame(cv_rows)
+    cv_df.to_csv(save_dir / f"{prefix}_cv.csv", index=False)
+    all_ratio = pd.concat(ratio_dfs, ignore_index=True)
+    all_ratio.to_csv(save_dir / f"{prefix}_all_folds.csv", index=False)
+    summary = summarize_ratio_results(all_ratio)
+    summary.to_csv(save_dir / f"{prefix}_summary.csv", index=False)
+    print(f"Saved: {save_dir / f'{prefix}_cv.csv'}")
+    print(f"Saved: {save_dir / f'{prefix}_all_folds.csv'}")
+    print(f"Saved: {save_dir / f'{prefix}_summary.csv'}")

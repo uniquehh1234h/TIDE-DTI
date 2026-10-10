@@ -1,0 +1,5 @@
+*.pt -text
+*.pkl -text
+*.pth -text
+*.ckpt -text
+train/**/best_model_fold*.pt filter=lfs diff=lfs merge=lfs -text

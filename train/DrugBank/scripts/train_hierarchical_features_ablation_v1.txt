@@ -1,0 +1,1224 @@
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import math
+import os
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import average_precision_score
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd().resolve()
+COMMON_PATH = SCRIPT_DIR / "semi_inductive_common_v8.txt"
+DEFAULT_FEATURE_PATH = (
+    SCRIPT_DIR / "v1_aligned" / "v1_finegrained_features.pt"
+)
+DEFAULT_HIERARCHICAL_FEATURE_PATH = (
+    SCRIPT_DIR / "v1_aligned" / "v1_hierarchical_drug_features.pt"
+)
+DEFAULT_SPLIT_DIR = SCRIPT_DIR / "split_cache_drug_cold"
+DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "results"
+SEQUENCE_VALIDATION_VERSION = 2
+EXPECTED_SEQUENCE_AUDIT = {
+    "primary_sequence_count": 1266,
+    "invalid_primary_count": 221,
+    "empty_primary_count": 2,
+    "fallback_sequence_count": 223,
+    "unresolved_count": 0,
+}
+
+ABLATION_SPECS = {
+    "full": {
+        "experiment": "full_framework_protbert_bfd_v1",
+        "description": "No ablation; ProtBert-BFD aligned full-framework control.",
+    },
+    "no_kl": {
+        "experiment": "ablation_no_confidence_regularization_protbert_bfd_v1",
+        "description": (
+            "Remove both confidence regularizers: the negative-evidence KL term and the "
+            "positive-confidence term."
+        ),
+    },
+    "no_dynamic": {
+        "experiment": "ablation_no_dynamic_update_protbert_bfd_v1",
+        "description": "Mine mixed hard negatives once at the first refresh epoch, then freeze them.",
+    },
+    "no_hard_negative": {
+        "experiment": "ablation_no_hard_negative_protbert_bfd_v1",
+        "description": "Keep periodic refresh, but replace all hard negatives with random negatives.",
+    },
+}
+
+
+def load_module(path: Path, module_name: str):
+    loader = importlib.machinery.SourceFileLoader(module_name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    loader.exec_module(module)
+    return module
+
+
+def torch_load(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+if not COMMON_PATH.exists():
+    raise FileNotFoundError(COMMON_PATH)
+C = load_module(COMMON_PATH, "coldstartcpi_guided_common_v8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Single-factor ablations for the hierarchical-feature V1 framework under strict "
+            "semi-inductive drug-cold evaluation."
+        )
+    )
+    parser.add_argument("--ablation", required=True, choices=sorted(ABLATION_SPECS))
+    parser.add_argument("--feature-path", type=Path, default=DEFAULT_FEATURE_PATH)
+    parser.add_argument(
+        "--hierarchical-feature-path", type=Path, default=DEFAULT_HIERARCHICAL_FEATURE_PATH
+    )
+    parser.add_argument("--split-cache-dir", type=Path, default=DEFAULT_SPLIT_DIR)
+    parser.add_argument(
+        "--save-dir",
+        type=Path,
+        default=None,
+        help="Optional exact output directory. By default, results/<ablation experiment> is used.",
+    )
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument("--num-heads", type=int, default=4)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--score-batch-size", type=int, default=64)
+    parser.add_argument("--num-epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--validation-frequency", type=int, default=5)
+    parser.add_argument("--hard-neg-pool", type=int, default=10000)
+    parser.add_argument("--train-neg-ratio", type=float, default=2.0)
+    parser.add_argument("--hard-to-random-ratio", type=float, default=2.0)
+    parser.add_argument("--hard-neg-update-freq", type=int, default=10)
+    parser.add_argument("--kl-lambda", type=float, default=1e-4)
+    parser.add_argument("--pos-conf-lambda", type=float, default=0.05)
+    parser.add_argument("--pos-weight", type=float, default=1.5)
+    parser.add_argument("--bedroc-alpha", type=float, default=80.5)
+    parser.add_argument(
+        "--ef-fractions", nargs="*", type=float, default=[0.005, 0.01, 0.02, 0.05]
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--eval-ratios", nargs="*", type=int, default=[1, 2, 5, 10, 20, 50, 100])
+    parser.add_argument("--folds", nargs="*", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an incomplete fold from its last atomically saved epoch.",
+    )
+    parser.add_argument(
+        "--restart-incomplete",
+        action="store_true",
+        help="Discard an incomplete epoch checkpoint and restart that fold from epoch 1.",
+    )
+    parser.add_argument("--device", type=str, default=None)
+    return parser.parse_args()
+
+
+class FeatureStore:
+    def __init__(self, bundle: dict, hierarchical: dict) -> None:
+        self.drug_global = bundle["drug_global"].float().contiguous()
+        self.drug_local = bundle["drug_local"].contiguous()
+        self.drug_mask = bundle["drug_padding_mask"].bool().contiguous()
+        self.protein_global = bundle["protein_global"].float().contiguous()
+        self.protein_local = bundle["protein_local"].contiguous()
+        self.protein_mask = bundle["protein_padding_mask"].bool().contiguous()
+        self.ecfp = hierarchical["ecfp"].float().contiguous()
+        self.descriptors_raw = hierarchical["descriptors"].float().contiguous()
+        self.functional_group_ids = hierarchical["functional_group_ids"].long().contiguous()
+        self.descriptor_mean = torch.zeros(self.descriptors_raw.size(1), dtype=torch.float32)
+        self.descriptor_std = torch.ones(self.descriptors_raw.size(1), dtype=torch.float32)
+
+    def fit_descriptor_scaler(self, train_drugs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        values = self.descriptors_raw[train_drugs.detach().cpu().long()]
+        self.descriptor_mean = values.mean(dim=0)
+        self.descriptor_std = values.std(dim=0, unbiased=False).clamp_min(1e-6)
+        return self.descriptor_mean.clone(), self.descriptor_std.clone()
+
+    def pair_batch(self, edge_index: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, ...]:
+        cpu_edges = edge_index.detach().cpu().long()
+        drug_index = cpu_edges[0]
+        protein_index = cpu_edges[1]
+        descriptors = (
+            self.descriptors_raw[drug_index] - self.descriptor_mean
+        ) / self.descriptor_std
+        functional_group_ids = self.functional_group_ids[drug_index]
+        return (
+            self.drug_global[drug_index].to(device, non_blocking=True),
+            self.drug_local[drug_index].to(device, dtype=torch.float32, non_blocking=True),
+            self.drug_mask[drug_index].to(device, non_blocking=True),
+            self.ecfp[drug_index].to(device, non_blocking=True),
+            descriptors.to(device, non_blocking=True),
+            functional_group_ids.to(device, non_blocking=True),
+            functional_group_ids.eq(0).to(device, non_blocking=True),
+            self.protein_global[protein_index].to(device, non_blocking=True),
+            self.protein_local[protein_index].to(device, dtype=torch.float32, non_blocking=True),
+            self.protein_mask[protein_index].to(device, non_blocking=True),
+        )
+
+
+class FeatureAdapter(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class InducedFitEvidentialModel(nn.Module):
+    def __init__(
+        self,
+        drug_dim: int,
+        protein_dim: int,
+        descriptor_dim: int,
+        functional_group_vocab: int,
+        drug_tokens: int,
+        functional_group_tokens: int,
+        protein_tokens: int,
+        hidden_dim: int,
+        num_heads: int,
+        num_layers: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError("--hidden-dim must be divisible by --num-heads")
+        self.drug_tokens = int(drug_tokens)
+        self.functional_group_tokens = int(functional_group_tokens)
+        self.protein_tokens = int(protein_tokens)
+        self.drug_global_adapter = FeatureAdapter(drug_dim, hidden_dim, dropout)
+        self.ecfp_adapter = nn.Sequential(
+            nn.Linear(2048, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+        self.descriptor_adapter = FeatureAdapter(descriptor_dim, hidden_dim, dropout)
+        self.functional_group_embedding = nn.Embedding(
+            functional_group_vocab, hidden_dim, padding_idx=0
+        )
+        self.functional_group_norm = nn.LayerNorm(hidden_dim)
+        self.drug_feature_gate = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim * 3),
+            nn.Sigmoid(),
+        )
+        self.drug_feature_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.drug_local_adapter = FeatureAdapter(drug_dim, hidden_dim, dropout)
+        self.protein_global_adapter = FeatureAdapter(protein_dim, hidden_dim, dropout)
+        self.protein_local_adapter = FeatureAdapter(protein_dim, hidden_dim, dropout)
+        self.type_embedding = nn.Embedding(5, hidden_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.joint_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.interaction = C.DeepGatedInteraction(hidden_dim)
+        pair_dim = hidden_dim * 3
+        self.decoder = nn.Sequential(
+            nn.Linear(pair_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.evidence_generator = nn.Sequential(
+            nn.Linear(pair_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 2),
+            nn.Softplus(),
+        )
+
+        type_ids = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.long),
+                torch.ones(self.drug_tokens, dtype=torch.long),
+                torch.full((self.functional_group_tokens,), 2, dtype=torch.long),
+                torch.full((1,), 3, dtype=torch.long),
+                torch.full((self.protein_tokens,), 4, dtype=torch.long),
+            ]
+        )
+        self.register_buffer("type_ids", type_ids, persistent=False)
+
+    def forward(
+        self,
+        drug_global: torch.Tensor,
+        drug_local: torch.Tensor,
+        drug_mask: torch.Tensor,
+        ecfp: torch.Tensor,
+        descriptors: torch.Tensor,
+        functional_group_ids: torch.Tensor,
+        functional_group_mask: torch.Tensor,
+        protein_global: torch.Tensor,
+        protein_local: torch.Tensor,
+        protein_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        group_tokens = self.functional_group_norm(
+            self.functional_group_embedding(functional_group_ids)
+        )
+        drug_sources = torch.cat(
+            [
+                self.drug_global_adapter(drug_global),
+                self.ecfp_adapter(ecfp),
+                self.descriptor_adapter(descriptors),
+            ],
+            dim=-1,
+        )
+        gated_sources = drug_sources * self.drug_feature_gate(drug_sources)
+        drug_global_token = self.drug_feature_fusion(gated_sources).unsqueeze(1)
+        drug_local_tokens = self.drug_local_adapter(drug_local)
+        protein_global_token = self.protein_global_adapter(protein_global).unsqueeze(1)
+        protein_local_tokens = self.protein_local_adapter(protein_local)
+        tokens = torch.cat(
+            [
+                drug_global_token,
+                drug_local_tokens,
+                group_tokens,
+                protein_global_token,
+                protein_local_tokens,
+            ],
+            dim=1,
+        )
+        tokens = tokens + self.type_embedding(self.type_ids).unsqueeze(0)
+        global_mask = torch.zeros((tokens.size(0), 1), dtype=torch.bool, device=tokens.device)
+        padding_mask = torch.cat(
+            [global_mask, drug_mask, functional_group_mask, global_mask, protein_mask], dim=1
+        )
+        encoded = self.final_norm(self.joint_encoder(tokens, src_key_padding_mask=padding_mask))
+
+        drug_pair = encoded[:, 0]
+        protein_pair = encoded[:, 1 + self.drug_tokens + self.functional_group_tokens]
+        interaction = self.interaction(drug_pair, protein_pair)
+        pair = torch.cat([drug_pair, protein_pair, interaction], dim=-1)
+        logits = self.decoder(pair).squeeze(-1)
+        alpha = self.evidence_generator(pair) + 1.0
+        return logits, alpha
+
+
+def normalized_ids(values) -> list[str]:
+    return [str(value) for value in values]
+
+
+def validate_inputs(feature_bundle: dict, hierarchical_bundle: dict) -> None:
+    required = [
+        "drug_global", "drug_local", "drug_padding_mask", "protein_global", "protein_local",
+        "protein_padding_mask", "drug_ids", "protein_ids", "metadata",
+    ]
+    missing = [key for key in required if key not in feature_bundle]
+    if missing:
+        raise KeyError(f"Fine-grained feature bundle is missing keys: {missing}")
+    hierarchical_required = [
+        "ecfp", "descriptors", "functional_group_ids", "drug_ids", "metadata",
+    ]
+    hierarchical_missing = [
+        key for key in hierarchical_required if key not in hierarchical_bundle
+    ]
+    if hierarchical_missing:
+        raise KeyError(f"Hierarchical feature bundle is missing keys: {hierarchical_missing}")
+    drug_ids = normalized_ids(feature_bundle["drug_ids"])
+    protein_ids = normalized_ids(feature_bundle["protein_ids"])
+    hierarchical_drug_ids = normalized_ids(hierarchical_bundle["drug_ids"])
+    if len(drug_ids) != len(set(drug_ids)):
+        raise ValueError("Fine-grained feature bundle contains duplicate drug IDs")
+    if len(protein_ids) != len(set(protein_ids)):
+        raise ValueError("Fine-grained feature bundle contains duplicate protein IDs")
+    if hierarchical_drug_ids != drug_ids:
+        raise ValueError(
+            "Hierarchical and fine-grained drug feature rows use different entity orders"
+        )
+    if feature_bundle["metadata"].get("uses_dti_labels") is not False:
+        raise ValueError("Feature provenance does not prove label-free extraction")
+    sequence_sources = feature_bundle["metadata"].get("protein_sequence_sources", {})
+    if sequence_sources.get("sequence_validation_version") != SEQUENCE_VALIDATION_VERSION:
+        raise ValueError(
+            "Fine-grained features predate strict protein-sequence repair; regenerate them "
+            "with prepare_small_dataset_v1_features_server.txt --force"
+        )
+    sequence_mismatches = {
+        key: {"expected": expected, "actual": sequence_sources.get(key)}
+        for key, expected in EXPECTED_SEQUENCE_AUDIT.items()
+        if sequence_sources.get(key) != expected
+    }
+    if sequence_mismatches:
+        raise ValueError(
+            "Fine-grained feature sequence audit is not the locked local707 repair:\n"
+            + json.dumps(sequence_mismatches, indent=2, ensure_ascii=True)
+        )
+    protein_metadata = feature_bundle["metadata"].get("protein_feature", {})
+    if protein_metadata.get("model") != "Rostlab/prot_bert_bfd":
+        raise ValueError(
+            "V1-aligned runs require protein_model='Rostlab/prot_bert_bfd'; "
+            f"bundle reports {protein_metadata.get('model')!r}"
+        )
+    if hierarchical_bundle["metadata"].get("uses_dti_labels") is not False:
+        raise ValueError("Hierarchical feature provenance does not prove label-free extraction")
+    if hierarchical_bundle["metadata"].get("protein_sequence_sources") != sequence_sources:
+        raise ValueError(
+            "Hierarchical and fine-grained bundles do not share the same repaired sequence "
+            "provenance; rebuild both with the sequence-fixed feature script"
+        )
+    if tuple(hierarchical_bundle["ecfp"].shape) != (len(drug_ids), 2048):
+        raise ValueError("Expected ECFP shape [num_drugs, 2048]")
+    drug_row_keys = ["drug_global", "drug_local", "drug_padding_mask"]
+    protein_row_keys = ["protein_global", "protein_local", "protein_padding_mask"]
+    hierarchical_row_keys = ["ecfp", "descriptors", "functional_group_ids"]
+    for key in drug_row_keys:
+        if int(feature_bundle[key].size(0)) != len(drug_ids):
+            raise ValueError(f"{key} row count does not match drug_ids")
+    for key in protein_row_keys:
+        if int(feature_bundle[key].size(0)) != len(protein_ids):
+            raise ValueError(f"{key} row count does not match protein_ids")
+    for key in hierarchical_row_keys:
+        if int(hierarchical_bundle[key].size(0)) != len(drug_ids):
+            raise ValueError(f"{key} row count does not match drug_ids")
+    if feature_bundle["drug_local"].ndim != 3 or feature_bundle["protein_local"].ndim != 3:
+        raise ValueError("Local feature tensors must be three-dimensional")
+    if feature_bundle["drug_padding_mask"].shape != feature_bundle["drug_local"].shape[:2]:
+        raise ValueError("drug_padding_mask shape does not match drug_local tokens")
+    if feature_bundle["protein_padding_mask"].shape != feature_bundle["protein_local"].shape[:2]:
+        raise ValueError("protein_padding_mask shape does not match protein_local tokens")
+
+
+def score_edges_batched(
+    model: InducedFitEvidentialModel,
+    feature_store: FeatureStore,
+    edge_index: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    outputs = []
+    with torch.no_grad():
+        for start in range(0, edge_index.size(1), batch_size):
+            batch_edges = edge_index[:, start : start + batch_size]
+            batch = feature_store.pair_batch(batch_edges, device)
+            logits, _ = model(*batch)
+            outputs.append(torch.sigmoid(logits))
+    if not outputs:
+        return torch.empty(0, device=device)
+    return torch.cat(outputs)
+
+
+def validation_aupr(
+    model: InducedFitEvidentialModel,
+    feature_store: FeatureStore,
+    edge_index: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+) -> float:
+    probabilities = score_edges_batched(model, feature_store, edge_index, device, batch_size)
+    return float(average_precision_score(labels.cpu().numpy(), probabilities.cpu().numpy()))
+
+
+def bedroc_score(labels: np.ndarray, scores: np.ndarray, alpha: float) -> float:
+    try:
+        from rdkit.ML.Scoring.Scoring import CalcBEDROC
+    except ImportError as exc:
+        raise ImportError("BEDROC evaluation requires RDKit") from exc
+    order = np.argsort(-scores, kind="mergesort")
+    ranked = [[float(scores[index]), int(labels[index])] for index in order]
+    return float(CalcBEDROC(ranked, 1, alpha))
+
+
+def enrichment_factor(
+    labels: np.ndarray, scores: np.ndarray, fraction: float
+) -> tuple[float, int, int]:
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("EF fractions must be in (0, 1]")
+    total = int(labels.size)
+    total_positives = int(labels.sum())
+    if total == 0 or total_positives == 0:
+        return float("nan"), 0, 0
+    top_n = max(1, int(math.ceil(total * fraction)))
+    top_indices = np.argsort(-scores, kind="mergesort")[:top_n]
+    hits = int(labels[top_indices].sum())
+    value = (hits / top_n) / (total_positives / total)
+    return float(value), hits, top_n
+
+
+def append_early_enrichment_metrics(
+    ratio_df: pd.DataFrame,
+    score_edges_fn,
+    test_pos: torch.Tensor,
+    test_neg_pool: torch.Tensor,
+    eval_ratios: list[int],
+    bedroc_alpha: float,
+    ef_fractions: list[float],
+) -> pd.DataFrame:
+    output = ratio_df.copy()
+    positive_scores = score_edges_fn(test_pos).detach().cpu().numpy()
+    bedroc_column = f"BEDROC_alpha_{bedroc_alpha:g}"
+    for ratio in eval_ratios:
+        negative_count = int(test_pos.size(1) * ratio)
+        if negative_count > test_neg_pool.size(1):
+            raise ValueError(
+                f"1:{ratio} needs {negative_count} negatives, pool has {test_neg_pool.size(1)}"
+            )
+        negative_scores = score_edges_fn(
+            test_neg_pool[:, :negative_count]
+        ).detach().cpu().numpy()
+        labels = np.concatenate(
+            [
+                np.ones(positive_scores.size, dtype=np.int64),
+                np.zeros(negative_scores.size, dtype=np.int64),
+            ]
+        )
+        scores = np.concatenate([positive_scores, negative_scores])
+        row_mask = output["Ratio"] == f"1:{ratio}"
+        if int(row_mask.sum()) != 1:
+            raise ValueError(f"Cannot match ratio row 1:{ratio}")
+        output.loc[row_mask, bedroc_column] = bedroc_score(labels, scores, bedroc_alpha)
+        for fraction in ef_fractions:
+            ef, hits, top_n = enrichment_factor(labels, scores, fraction)
+            label = f"{fraction * 100:g}pct"
+            output.loc[row_mask, f"EF_{label}"] = ef
+            output.loc[row_mask, f"EF_hits_{label}"] = hits
+            output.loc[row_mask, f"EF_topN_{label}"] = top_n
+    return output
+
+
+def load_fold_files(split_dir: Path, selected_folds: list[int] | None) -> list[Path]:
+    paths = sorted(split_dir.glob("split_fold*.pt"), key=C.fold_number_from_path)
+    if not paths:
+        raise FileNotFoundError(f"No split_fold*.pt files found in {split_dir}")
+    if selected_folds:
+        wanted = set(selected_folds)
+        paths = [path for path in paths if C.fold_number_from_path(path) in wanted]
+        missing = wanted - {C.fold_number_from_path(path) for path in paths}
+        if missing:
+            raise ValueError(f"Requested folds are missing from split cache: {sorted(missing)}")
+    return paths
+
+
+def reconstruct_global_positive_set(split_files: list[Path]) -> set[tuple[int, int]]:
+    """Recover all positives from training partitions without loading a relation graph."""
+    global_positive_set: set[tuple[int, int]] = set()
+    active_drugs: set[int] = set()
+    drugs_seen_in_training: set[int] = set()
+    for split_file in split_files:
+        split = torch_load(split_file)
+        global_positive_set.update(C.edge_set(split["pos_tr"]))
+        active_drugs.update(int(value) for value in split["train_drugs"].tolist())
+        active_drugs.update(int(value) for value in split["val_drugs"].tolist())
+        active_drugs.update(int(value) for value in split["test_drugs"].tolist())
+        drugs_seen_in_training.update(int(value) for value in split["train_drugs"].tolist())
+    missing_train_coverage = active_drugs - drugs_seen_in_training
+    if missing_train_coverage:
+        raise ValueError(
+            "Cannot reconstruct all positives from split cache because some active drugs never "
+            f"appear in a training partition: {sorted(missing_train_coverage)[:10]}"
+        )
+    if not global_positive_set:
+        raise ValueError("No positive training edges were found in the split cache")
+    return global_positive_set
+
+
+def validate_split_feature_indices(split: dict, num_drugs: int, num_proteins: int, fold: int) -> None:
+    edge_keys = [
+        "pos_tr", "pos_val", "test_pos", "neg_tr", "neg_val_es", "neg_te",
+        "val_neg_pool", "test_neg_pool",
+    ]
+    for key in edge_keys:
+        edges = split[key]
+        if edges.ndim != 2 or edges.size(0) != 2:
+            raise ValueError(f"Fold {fold} {key} must have shape [2, N]")
+        if edges.numel() == 0:
+            continue
+        if int(edges[0].min()) < 0 or int(edges[0].max()) >= num_drugs:
+            raise ValueError(f"Fold {fold} {key} contains a drug index outside feature rows")
+        if int(edges[1].min()) < 0 or int(edges[1].max()) >= num_proteins:
+            raise ValueError(f"Fold {fold} {key} contains a protein index outside feature rows")
+
+
+def collect_saved_results(save_dir: Path) -> tuple[list[dict], list[pd.DataFrame]]:
+    records = []
+    ratios = []
+    for record_path in sorted(save_dir.glob("fold*_record.json")):
+        with record_path.open("r", encoding="utf-8") as handle:
+            records.append(json.load(handle))
+    for ratio_path in sorted(save_dir.glob("fold*_ratios.csv")):
+        ratios.append(pd.read_csv(ratio_path))
+    return records, ratios
+
+
+def save_extended_ratio_summary(
+    save_dir: Path, ratio_dfs: list[pd.DataFrame], experiment_name: str
+) -> None:
+    all_ratios = pd.concat(ratio_dfs, ignore_index=True)
+    numeric_columns = [
+        column
+        for column in all_ratios.select_dtypes(include=[np.number]).columns
+        if column != "Fold"
+    ]
+    summary = all_ratios.groupby("Ratio", sort=False)[numeric_columns].agg(["mean", "std"])
+    summary.columns = [f"{column}_{stat}" for column, stat in summary.columns]
+    summary.reset_index().to_csv(
+        save_dir / f"{experiment_name}_extended_summary.csv", index=False
+    )
+
+
+def dynamic_negative_counts(
+    positive_count: int,
+    train_neg_ratio: float,
+    hard_to_random_ratio: float,
+    use_hard_negatives: bool,
+) -> tuple[int, int, int]:
+    total_negative_count = int(round(positive_count * train_neg_ratio))
+    if total_negative_count < 1:
+        raise ValueError("The ratio-based dynamic negative count must be positive")
+    if not use_hard_negatives:
+        return total_negative_count, 0, total_negative_count
+    random_negative_count = max(
+        1, int(round(total_negative_count / (hard_to_random_ratio + 1.0)))
+    )
+    hard_negative_count = total_negative_count - random_negative_count
+    return total_negative_count, hard_negative_count, random_negative_count
+
+
+def atomic_torch_save(value, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
+def cpu_clone_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: cpu_clone_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [cpu_clone_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(cpu_clone_tree(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def move_optimizer_state_to_device(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def capture_rng_state() -> dict:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and state.get("torch_cuda") is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def build_resume_signature(
+    args: argparse.Namespace,
+    fold: int,
+    split_file: Path,
+    effective_kl_lambda: float,
+    effective_pos_conf_lambda: float,
+    artifact_sha256: dict[str, str],
+) -> dict:
+    return {
+        "schema_version": 1,
+        "ablation": args.ablation,
+        "fold": fold,
+        "seed": args.seed,
+        "feature_path": str(args.feature_path.resolve()),
+        "hierarchical_feature_path": str(args.hierarchical_feature_path.resolve()),
+        "split_path": str(split_file.resolve()),
+        "feature_sha256": artifact_sha256["feature"],
+        "hierarchical_feature_sha256": artifact_sha256["hierarchical_feature"],
+        "feature_manifest_sha256": artifact_sha256["feature_manifest"],
+        "training_code_sha256": artifact_sha256["training_code"],
+        "split_sha256": file_sha256(split_file),
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "batch_size": args.batch_size,
+        "score_batch_size": args.score_batch_size,
+        "num_epochs": args.num_epochs,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "patience": args.patience,
+        "validation_frequency": args.validation_frequency,
+        "hard_neg_pool": args.hard_neg_pool,
+        "train_neg_ratio": args.train_neg_ratio,
+        "hard_to_random_ratio": args.hard_to_random_ratio,
+        "hard_neg_update_freq": args.hard_neg_update_freq,
+        "effective_kl_lambda": effective_kl_lambda,
+        "effective_pos_conf_lambda": effective_pos_conf_lambda,
+        "pos_weight": args.pos_weight,
+    }
+
+
+def validate_resume_signature(saved: dict, current: dict, path: Path) -> None:
+    if saved == current:
+        return
+    differences = {
+        key: {"saved": saved.get(key), "current": current.get(key)}
+        for key in sorted(set(saved) | set(current))
+        if saved.get(key) != current.get(key)
+    }
+    raise ValueError(
+        f"Epoch checkpoint settings do not match the current command: {path}\n"
+        + json.dumps(differences, indent=2, ensure_ascii=True)
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    if args.resume and args.restart_incomplete:
+        raise ValueError("--resume and --restart-incomplete cannot be used together")
+    ablation_spec = ABLATION_SPECS[args.ablation]
+    experiment_name = ablation_spec["experiment"]
+    if args.save_dir is None:
+        args.save_dir = DEFAULT_RESULTS_ROOT / experiment_name
+    for path in [
+        args.feature_path,
+        args.hierarchical_feature_path,
+        args.split_cache_dir,
+    ]:
+        if not path.exists():
+            raise FileNotFoundError(path)
+    if args.batch_size < 1 or args.score_batch_size < 1:
+        raise ValueError("Batch sizes must be positive")
+    if args.validation_frequency < 1 or args.hard_neg_update_freq < 1:
+        raise ValueError("Validation and hard-negative update frequencies must be positive")
+    if args.train_neg_ratio <= 0 or args.hard_to_random_ratio <= 0:
+        raise ValueError("Negative-sampling ratios must be positive")
+    if not args.ef_fractions:
+        raise ValueError("--ef-fractions cannot be empty")
+    args.save_dir.mkdir(parents=True, exist_ok=True)
+    C.set_seed(args.seed)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    feature_bundle = torch_load(args.feature_path)
+    hierarchical_bundle = torch_load(args.hierarchical_feature_path)
+    validate_inputs(feature_bundle, hierarchical_bundle)
+    feature_manifest_path = args.feature_path.with_name("v1_aligned_feature_manifest.json")
+    if not feature_manifest_path.exists():
+        raise FileNotFoundError(
+            f"Feature manifest is required for provenance validation: {feature_manifest_path}"
+        )
+    with feature_manifest_path.open("r", encoding="utf-8") as handle:
+        feature_manifest = json.load(handle)
+    if feature_manifest.get("protein_sequence_sources") != feature_bundle["metadata"].get(
+        "protein_sequence_sources"
+    ):
+        raise ValueError("Feature bundle and feature manifest report different sequence provenance")
+    training_code_path = Path(__file__).resolve()
+    artifact_sha256 = {
+        "feature": file_sha256(args.feature_path),
+        "hierarchical_feature": file_sha256(args.hierarchical_feature_path),
+        "feature_manifest": file_sha256(feature_manifest_path),
+        "training_code": file_sha256(training_code_path),
+    }
+    feature_store = FeatureStore(feature_bundle, hierarchical_bundle)
+    all_split_files = load_fold_files(args.split_cache_dir, None)
+    global_pos_set = reconstruct_global_positive_set(all_split_files)
+    split_files = load_fold_files(args.split_cache_dir, args.folds)
+    effective_kl_lambda = 0.0 if args.ablation == "no_kl" else args.kl_lambda
+    effective_pos_conf_lambda = 0.0 if args.ablation == "no_kl" else args.pos_conf_lambda
+
+    drug_dim = int(feature_store.drug_global.size(1))
+    protein_dim = int(feature_store.protein_global.size(1))
+    descriptor_dim = int(feature_store.descriptors_raw.size(1))
+    functional_group_vocab = int(feature_store.functional_group_ids.max()) + 1
+    drug_tokens = int(feature_store.drug_local.size(1))
+    functional_group_tokens = int(feature_store.functional_group_ids.size(1))
+    protein_tokens = int(feature_store.protein_local.size(1))
+    print(f"Device: {device}")
+    print("Protocol: strict semi-inductive drug-cold, protein-known")
+    print(f"Ablation: {args.ablation} | {ablation_spec['description']}")
+    print("Training: weak-balanced labels + evidential loss + dual validation")
+    print(
+        f"Effective controls: KL lambda={effective_kl_lambda:g}; "
+        f"positive-confidence lambda={effective_pos_conf_lambda:g}"
+    )
+    print(
+        f"Dynamic negative policy: positives/negatives=1:{args.train_neg_ratio:g}; "
+        f"hard/random={args.hard_to_random_ratio:g}:1 within the negative set"
+    )
+    print("Selection: drug-cold early-stop validation; ratio-specific validation selects thresholds")
+    print("Relation graph: not loaded; positive-pair audit is reconstructed from all split caches")
+    print(
+        "Feature access: Mol2Vec global/local + ECFP + descriptors + functional groups; "
+        "ProtBert-BFD global/grouped-residue tokens"
+    )
+    print(
+        f"Pair tokens: 1 + {drug_tokens} + {functional_group_tokens} + 1 + {protein_tokens}"
+    )
+    print(f"BEDROC alpha={args.bedroc_alpha:g}; EF fractions={args.ef_fractions}")
+    print(f"Feature SHA256: {artifact_sha256['feature']}")
+    print(f"Folds: {[C.fold_number_from_path(path) for path in split_files]}")
+
+    for split_file in split_files:
+        fold = C.fold_number_from_path(split_file)
+        checkpoint_path = args.save_dir / f"best_model_fold{fold}.pt"
+        fold_ratio_path = args.save_dir / f"fold{fold}_ratios.csv"
+        fold_record_path = args.save_dir / f"fold{fold}_record.json"
+        epoch_checkpoint_path = args.save_dir / f"epoch_checkpoint_fold{fold}.pt"
+        if args.resume and checkpoint_path.exists() and fold_ratio_path.exists() and fold_record_path.exists():
+            with fold_record_path.open("r", encoding="utf-8") as handle:
+                completed_record = json.load(handle)
+            completed_hashes = {
+                "feature": completed_record.get("FeatureSHA256"),
+                "hierarchical_feature": completed_record.get("HierarchicalFeatureSHA256"),
+                "feature_manifest": completed_record.get("FeatureManifestSHA256"),
+                "training_code": completed_record.get("TrainingCodeSHA256"),
+            }
+            if completed_hashes != artifact_sha256:
+                raise ValueError(
+                    f"Fold {fold} complete outputs belong to different/legacy features or code; "
+                    "archive the old result directory before using --resume.\n"
+                    + json.dumps(
+                        {"saved": completed_hashes, "current": artifact_sha256},
+                        indent=2,
+                        ensure_ascii=True,
+                    )
+                )
+            if epoch_checkpoint_path.exists():
+                epoch_checkpoint_path.unlink()
+            print(f"Fold {fold}: complete outputs found, skipping due to --resume")
+            continue
+
+        C.set_seed(args.seed + fold)
+        print(f"\n=== Hierarchical features + full v8 framework fold {fold} ===")
+        split = torch_load(split_file)
+        validate_split_feature_indices(
+            split,
+            num_drugs=len(feature_bundle["drug_ids"]),
+            num_proteins=len(feature_bundle["protein_ids"]),
+            fold=fold,
+        )
+        C.validate_semi_split(split, global_pos_set, fold)
+        pos_tr = split["pos_tr"].cpu()
+        pos_val = split["pos_val"].cpu()
+        test_pos = split["test_pos"].cpu()
+        neg_tr = split["neg_tr"].cpu()
+        neg_val = split["neg_val_es"].cpu()
+        val_neg_pool = split["val_neg_pool"].cpu()
+        test_neg_pool = split["test_neg_pool"].cpu()
+        train_drugs = split["train_drugs"].cpu()
+        train_proteins = split["train_proteins"].cpu()
+        descriptor_mean, descriptor_std = feature_store.fit_descriptor_scaler(train_drugs)
+        dynamic_negative_total, fold_hard_negative_count, fold_random_negative_count = (
+            dynamic_negative_counts(
+                positive_count=int(pos_tr.size(1)),
+                train_neg_ratio=args.train_neg_ratio,
+                hard_to_random_ratio=args.hard_to_random_ratio,
+                use_hard_negatives=args.ablation != "no_hard_negative",
+            )
+        )
+
+        train_edges = torch.cat([pos_tr, neg_tr], dim=1)
+        train_labels = torch.cat([torch.ones(pos_tr.size(1)), torch.zeros(neg_tr.size(1))])
+        print(
+            f"Fold {fold} initial weak-balanced set: pos/neg="
+            f"{pos_tr.size(1)}/{neg_tr.size(1)}; dynamic negative target="
+            f"{dynamic_negative_total} "
+            f"({fold_hard_negative_count} hard + {fold_random_negative_count} random)"
+        )
+        val_edges = torch.cat([pos_val, neg_val], dim=1)
+        val_labels = torch.cat([torch.ones(pos_val.size(1)), torch.zeros(neg_val.size(1))])
+        forbidden_all = global_pos_set | C.edge_set(val_neg_pool) | C.edge_set(test_neg_pool)
+
+        model = InducedFitEvidentialModel(
+            drug_dim=drug_dim,
+            protein_dim=protein_dim,
+            descriptor_dim=descriptor_dim,
+            functional_group_vocab=functional_group_vocab,
+            drug_tokens=drug_tokens,
+            functional_group_tokens=functional_group_tokens,
+            protein_tokens=protein_tokens,
+            hidden_dim=args.hidden_dim,
+            num_heads=args.num_heads,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+        ).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        best_val_aupr = -1.0
+        best_state = None
+        best_epoch = 0
+        patience_count = 0
+        start_epoch = 1
+        training_finished = False
+        resumed_from_epoch = None
+        resume_signature = build_resume_signature(
+            args,
+            fold,
+            split_file,
+            effective_kl_lambda,
+            effective_pos_conf_lambda,
+            artifact_sha256,
+        )
+
+        if epoch_checkpoint_path.exists():
+            if args.restart_incomplete:
+                epoch_checkpoint_path.unlink()
+                temporary = epoch_checkpoint_path.with_suffix(epoch_checkpoint_path.suffix + ".tmp")
+                if temporary.exists():
+                    temporary.unlink()
+                print(f"Fold {fold}: discarded incomplete epoch checkpoint")
+            elif not args.resume:
+                raise FileExistsError(
+                    f"Incomplete epoch checkpoint exists: {epoch_checkpoint_path}. "
+                    "Use --resume to continue or --restart-incomplete to restart this fold."
+                )
+            else:
+                progress = torch_load(epoch_checkpoint_path)
+                validate_resume_signature(
+                    progress.get("resume_signature", {}), resume_signature, epoch_checkpoint_path
+                )
+                model.load_state_dict(progress["model_state"])
+                optimizer.load_state_dict(progress["optimizer_state"])
+                move_optimizer_state_to_device(optimizer, device)
+                train_edges = progress["train_edges"].cpu()
+                train_labels = progress["train_labels"].cpu()
+                best_val_aupr = float(progress["best_val_aupr"])
+                best_state = progress.get("best_state")
+                best_epoch = int(progress["best_epoch"])
+                patience_count = int(progress["patience_count"])
+                last_completed_epoch = int(progress["last_completed_epoch"])
+                start_epoch = last_completed_epoch + 1
+                resumed_from_epoch = last_completed_epoch
+                training_finished = bool(progress.get("training_finished", False))
+                restore_rng_state(progress["rng_state"])
+                print(
+                    f"Fold {fold}: resumed after epoch {last_completed_epoch}; "
+                    f"next epoch={start_epoch}, best epoch={best_epoch}, "
+                    f"best val AUPR={best_val_aupr:.4f}, patience={patience_count}"
+                )
+
+        epoch_iterator = range(start_epoch, args.num_epochs + 1) if not training_finished else []
+        for epoch in epoch_iterator:
+            model.train()
+            permutation = torch.randperm(train_edges.size(1))
+            epoch_loss = 0.0
+            seen = 0
+            for start in range(0, train_edges.size(1), args.batch_size):
+                selected = permutation[start : start + args.batch_size]
+                batch_edges = train_edges[:, selected]
+                batch_labels = train_labels[selected].to(device)
+                pair_features = feature_store.pair_batch(batch_edges, device)
+                optimizer.zero_grad(set_to_none=True)
+                logits, alpha = model(*pair_features)
+                loss = C.evidential_loss(
+                    logits,
+                    alpha,
+                    batch_labels,
+                    epoch,
+                    args.num_epochs,
+                    args.pos_weight,
+                    effective_kl_lambda,
+                    effective_pos_conf_lambda,
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                count = int(batch_labels.numel())
+                epoch_loss += float(loss.detach()) * count
+                seen += count
+
+            refresh_due = epoch % args.hard_neg_update_freq == 0
+            if args.ablation == "no_dynamic":
+                refresh_due = epoch == args.hard_neg_update_freq
+            if refresh_due:
+                model.eval()
+
+                def score_for_mining(edges: torch.Tensor) -> torch.Tensor:
+                    return score_edges_batched(model, feature_store, edges, device, args.score_batch_size)
+
+                dynamic_edges, dynamic_labels = C.build_dynamic_train_edges(
+                    pos_tr=pos_tr.to(device),
+                    train_drugs=train_drugs,
+                    train_proteins=train_proteins,
+                    forbidden_pairs=forbidden_all,
+                    score_edges_fn=score_for_mining,
+                    device=device,
+                    seed=args.seed + fold * 10000 + epoch,
+                    hard_neg_pool=args.hard_neg_pool,
+                    random_neg_num=fold_random_negative_count,
+                    hard_neg_num=fold_hard_negative_count,
+                )
+                train_edges = dynamic_edges.cpu()
+                train_labels = dynamic_labels.cpu()
+                print(
+                    f"Fold {fold} epoch {epoch}: "
+                    f"{'fixed static set' if args.ablation == 'no_dynamic' else 'refreshed negatives'}; "
+                    f"hard/random={fold_hard_negative_count}/{fold_random_negative_count}; "
+                    f"train pos/neg={pos_tr.size(1)}/{int((train_labels == 0).sum())}"
+                )
+
+            should_stop = False
+            if epoch % args.validation_frequency == 0:
+                model.eval()
+                val_aupr = validation_aupr(
+                    model, feature_store, val_edges, val_labels, device, args.score_batch_size
+                )
+                print(
+                    f"Fold {fold} epoch {epoch:03d} | loss={epoch_loss / max(seen, 1):.5f} "
+                    f"| cold-val AUPR={val_aupr:.4f}"
+                )
+                if val_aupr > best_val_aupr:
+                    best_val_aupr = val_aupr
+                    best_epoch = epoch
+                    best_state = {
+                        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                    }
+                    patience_count = 0
+                else:
+                    patience_count += 1
+                    if patience_count >= args.patience:
+                        print(f"Fold {fold}: early stop at epoch {epoch}")
+                        should_stop = True
+
+            training_finished = should_stop or epoch == args.num_epochs
+            epoch_progress = {
+                "schema_version": 1,
+                "resume_signature": resume_signature,
+                "fold": fold,
+                "last_completed_epoch": epoch,
+                "training_finished": training_finished,
+                "model_state": {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
+                },
+                "optimizer_state": cpu_clone_tree(optimizer.state_dict()),
+                "train_edges": train_edges.cpu().clone(),
+                "train_labels": train_labels.cpu().clone(),
+                "best_val_aupr": best_val_aupr,
+                "best_state": cpu_clone_tree(best_state) if best_state is not None else None,
+                "best_epoch": best_epoch,
+                "patience_count": patience_count,
+                "rng_state": capture_rng_state(),
+                "last_epoch_loss": epoch_loss / max(seen, 1),
+            }
+            atomic_torch_save(epoch_progress, epoch_checkpoint_path)
+            if epoch == start_epoch or epoch % 10 == 0 or training_finished:
+                print(f"Fold {fold}: epoch checkpoint saved after epoch {epoch}")
+            if should_stop:
+                break
+
+        if best_state is None:
+            raise RuntimeError(f"Fold {fold} produced no valid checkpoint")
+        model.load_state_dict(best_state)
+        checkpoint = {
+            "model_state": best_state,
+            "fold": fold,
+            "best_epoch": best_epoch,
+            "best_val_aupr": best_val_aupr,
+            "model_config": {
+                "drug_dim": drug_dim,
+                "protein_dim": protein_dim,
+                "descriptor_dim": descriptor_dim,
+                "functional_group_vocab": functional_group_vocab,
+                "drug_tokens": drug_tokens,
+                "functional_group_tokens": functional_group_tokens,
+                "protein_tokens": protein_tokens,
+                "hidden_dim": args.hidden_dim,
+                "num_heads": args.num_heads,
+                "num_layers": args.num_layers,
+                "dropout": args.dropout,
+            },
+            "feature_path": str(args.feature_path.resolve()),
+            "hierarchical_feature_path": str(args.hierarchical_feature_path.resolve()),
+            "feature_manifest_path": str(feature_manifest_path.resolve()),
+            "artifact_sha256": artifact_sha256,
+            "descriptor_mean": descriptor_mean,
+            "descriptor_std": descriptor_std,
+            "split_path": str(split_file.resolve()),
+            "ablation": args.ablation,
+            "effective_kl_lambda": effective_kl_lambda,
+            "effective_pos_conf_lambda": effective_pos_conf_lambda,
+            "train_negative_ratio": args.train_neg_ratio,
+            "dynamic_negative_total": dynamic_negative_total,
+            "dynamic_hard_negative_count": fold_hard_negative_count,
+            "dynamic_random_negative_count": fold_random_negative_count,
+            "uses_repeated_negative_refresh": args.ablation != "no_dynamic",
+            "uses_score_based_hard_negatives": args.ablation != "no_hard_negative",
+            "resumed_from_epoch": resumed_from_epoch,
+        }
+        atomic_torch_save(checkpoint, checkpoint_path)
+
+        model.eval()
+
+        def score_for_evaluation(edges: torch.Tensor) -> torch.Tensor:
+            return score_edges_batched(model, feature_store, edges, device, args.score_batch_size)
+
+        fold_ratio_df = C.evaluate_ratios_with_score_fn(
+            score_for_evaluation,
+            pos_val,
+            val_neg_pool,
+            test_pos,
+            test_neg_pool,
+            args.eval_ratios,
+            device,
+        )
+        fold_ratio_df = append_early_enrichment_metrics(
+            ratio_df=fold_ratio_df,
+            score_edges_fn=score_for_evaluation,
+            test_pos=test_pos,
+            test_neg_pool=test_neg_pool,
+            eval_ratios=args.eval_ratios,
+            bedroc_alpha=args.bedroc_alpha,
+            ef_fractions=args.ef_fractions,
+        )
+        fold_ratio_df.insert(0, "Fold", fold)
+        fold_ratio_df.to_csv(fold_ratio_path, index=False)
+        ratio100 = fold_ratio_df.loc[fold_ratio_df["Ratio"] == "1:100"]
+        record = {
+            "Fold": fold,
+            "BestEpoch": best_epoch,
+            "ValAUPR_ES": best_val_aupr,
+            "AUPR_1_100": float(ratio100["AUPR"].iloc[0]) if not ratio100.empty else None,
+            "Checkpoint": str(checkpoint_path),
+            "FeatureSHA256": artifact_sha256["feature"],
+            "HierarchicalFeatureSHA256": artifact_sha256["hierarchical_feature"],
+            "FeatureManifestSHA256": artifact_sha256["feature_manifest"],
+            "TrainingCodeSHA256": artifact_sha256["training_code"],
+            "ResumedFromEpoch": resumed_from_epoch,
+            "UsesEpochCheckpointResume": True,
+            "TrainDrugs": int(split["train_drugs"].numel()),
+            "ValDrugs": int(split["val_drugs"].numel()),
+            "TestDrugs": int(split["test_drugs"].numel()),
+            "TrainPos": int(pos_tr.size(1)),
+            "InitialTrainNeg": int(neg_tr.size(1)),
+            "DynamicTrainNeg": dynamic_negative_total,
+            "DynamicHardNeg": fold_hard_negative_count,
+            "DynamicRandomNeg": fold_random_negative_count,
+            "ValPos": int(pos_val.size(1)),
+            "TestPos": int(test_pos.size(1)),
+            "UsesRelationGraph": False,
+            "UsesFineGrainedJointTransformer": True,
+            "UsesRepeatedNegativeRefresh": args.ablation != "no_dynamic",
+            "UsesScoreBasedHardNegatives": args.ablation != "no_hard_negative",
+            "UsesKLRegularizer": args.ablation != "no_kl",
+            "UsesEvidentialHead": True,
+            "UsesPositiveConfidenceConstraint": args.ablation != "no_kl",
+            "UsesDualValidation": True,
+            "UsesHierarchicalDrugFeatures": True,
+            "BEDROC_1_100": (
+                float(ratio100[f"BEDROC_alpha_{args.bedroc_alpha:g}"].iloc[0])
+                if not ratio100.empty
+                else None
+            ),
+        }
+        with fold_record_path.open("w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, ensure_ascii=True)
+        if epoch_checkpoint_path.exists():
+            epoch_checkpoint_path.unlink()
+        print(f"Fold {fold} saved: {checkpoint_path}")
+
+    cv_rows, ratio_dfs = collect_saved_results(args.save_dir)
+    if not cv_rows or not ratio_dfs:
+        raise RuntimeError("No complete fold result files were found")
+    C.save_result_tables(args.save_dir, experiment_name, cv_rows, ratio_dfs)
+    save_extended_ratio_summary(args.save_dir, ratio_dfs, experiment_name)
+    run_manifest = {
+        "experiment": experiment_name,
+        "ablation": args.ablation,
+        "ablation_description": ablation_spec["description"],
+        "baseline_training_code": str(
+            (SCRIPT_DIR / "train_hierarchical_features_full_framework_v1.txt").resolve()
+        ),
+        "changed_scope": [ablation_spec["description"]],
+        "preserved_framework": [
+            "strict semi-inductive drug-cold split cache",
+            "weak-balanced training",
+            "drug-cold early-stop validation",
+            "ratio-specific threshold validation",
+            "DeepGatedInteraction and evidential prediction heads",
+            "hierarchical drug and fine-grained protein feature model",
+        ],
+        "uses_relation_graph": False,
+        "epoch_checkpoint_resume": True,
+        "epoch_checkpoint_pattern": "epoch_checkpoint_fold{fold}.pt",
+        "epoch_checkpoint_atomic_write": True,
+        "positive_pair_audit_source": "union of pos_tr across all split folds",
+        "effective_kl_lambda": effective_kl_lambda,
+        "effective_pos_conf_lambda": effective_pos_conf_lambda,
+        "dynamic_negative_count_policy": "round(train_positive_count * train_negative_ratio)",
+        "train_negative_ratio": args.train_neg_ratio,
+        "dynamic_hard_to_random_ratio": args.hard_to_random_ratio,
+        "uses_repeated_negative_refresh": args.ablation != "no_dynamic",
+        "uses_score_based_hard_negatives": args.ablation != "no_hard_negative",
+        "bedroc_alpha": args.bedroc_alpha,
+        "ef_fractions": args.ef_fractions,
+        "feature_path": str(args.feature_path.resolve()),
+        "feature_sha256": artifact_sha256["feature"],
+        "hierarchical_feature_path": str(args.hierarchical_feature_path.resolve()),
+        "hierarchical_feature_sha256": artifact_sha256["hierarchical_feature"],
+        "feature_manifest_path": str(feature_manifest_path.resolve()),
+        "feature_manifest_sha256": artifact_sha256["feature_manifest"],
+        "training_code": str(training_code_path),
+        "training_code_sha256": artifact_sha256["training_code"],
+        "protein_sequence_sources": feature_manifest["protein_sequence_sources"],
+        "split_cache_dir": str(args.split_cache_dir.resolve()),
+    }
+    with (args.save_dir / "run_manifest.json").open("w", encoding="utf-8") as handle:
+        json.dump(run_manifest, handle, indent=2, ensure_ascii=True)
+
+
+if __name__ == "__main__":
+    main()
