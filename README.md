@@ -106,7 +106,7 @@ python -m pip install --upgrade pip
 python -m pip install -r train/BioSNAP/requirements.txt
 ```
 
-The BioSNAP requirements file is the most complete supplied environment list. Install the PyTorch build that matches your CUDA version before installing PyTorch Geometric when using a GPU.
+ Install the PyTorch build that matches your CUDA version before installing PyTorch Geometric when using a GPU.
 
 ## Feature requirements
 
